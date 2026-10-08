@@ -50,7 +50,7 @@ node server.js         :: 只起服务，自己访问 http://127.0.0.1:5173
 ```
 
 电脑和手机连**同一个 Wi-Fi**，双击后用手机浏览器打开「理记手机服务」窗口里打印的地址
-（即可 —— 网页版是纯前端的，电脑这台进程只发静态文件，
+即可 —— 网页版是纯前端的，电脑这台进程只发静态文件，
 没有账号 / 数据库接口。要点：
 
 - **首次启动**若弹出 Windows 防火墙提示，勾选「专用网络」并点「允许访问」，否则手机连不上；
@@ -217,6 +217,12 @@ tools/                             自检与打包脚本（make-bat.js 生成全
 > （GBK + CRLF），不直接入库，克隆后跑 `node tools/make-bat.js` 生成；
 > `electron/build/icon.png` 可由 `tools/icon-render` 重新渲染，仓库里同时存了一份 base64
 > 副本 `electron/build/icon.png.b64`（`node -e "require('fs').writeFileSync('electron/build/icon.png', Buffer.from(require('fs').readFileSync('electron/build/icon.png.b64','utf8'),'base64'))"`）。
+
+> **为什么仓库里没有 `网页部署包\` 文件夹**：它只是根目录
+> `index.html / app.js / styles.css / oss.js / icon.svg` 五个文件的拷贝，仓库里已有原件，
+> 不再存重复（存两份容易改一处漏一处）。要部署到静态托管（见「公网网页版」一节），
+> 把这五个文件复制到一个文件夹（或直接拖根目录文件）上传即可；
+> 跑 `node tools/make-bat.js` 也会自动生成这个文件夹。
 
 ---
 
