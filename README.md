@@ -73,9 +73,9 @@ node server.js         :: 只起服务，自己访问 http://127.0.0.1:5173
 
 | 服务商 | Bucket | Endpoint | 地域 |
 |---|---|---|---|
-| 阿里云 OSS | `liji-docs` | `https://oss-cn-hangzhou.aliyuncs.com` | `cn-hangzhou` |
-| 腾讯云 COS | `liji-1250000000`（带 APPID） | 留空 | `ap-guangzhou`（必填） |
-| S3 兼容（AWS / MinIO / R2） | `liji-docs` | `http://192.168.1.9:9000` | `us-east-1` |
+| 阿里云 OSS | `liji-docs`（示例） | `https://oss-cn-hangzhou.aliyuncs.com`（示例） | `cn-hangzhou`（示例） |
+| 腾讯云 COS | `liji-1250000000`（带 APPID）（示例） | 留空 | `ap-guangzhou`（必填）（示例） |
+| S3 兼容（AWS / MinIO / R2） | `liji-docs`（示例） | `http://192.168.1.9:9000` （示例）| `us-east-1` （示例）|
 
 - **MinIO / 自建**：勾上「路径风格」。
 - **阿里云新地域的桶**连不上（报 `SignatureVersionNotSupported`）→ 签名版本切 **V4**。
