@@ -1,0 +1,7 @@
+{
+  "name": "liji-icon-render",
+  "version": "1.0.0",
+  "private": true,
+  "description": "把 SVG 徽标渲染成 PNG（供打包生成 exe 图标用）",
+  "main": "main.js"
+}

@@ -1,0 +1,17 @@
+# ---- 构建产物（可由源码重新生成）----
+dist/
+electron/web/
+网页部署包/
+
+# ---- 依赖 ----
+electron/node_modules/
+.npm-tmp/
+
+# ---- 日志 / 临时 / 截图 ----
+*.log
+build-log*.txt
+_test-lite.log
+_e2e-shots/
+
+# ---- 本地数据 ----
+理记数据/

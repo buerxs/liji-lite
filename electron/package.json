@@ -1,0 +1,52 @@
+{
+  "name": "liji",
+  "version": "1.2.0",
+  "description": "理记 · 轻享版 —— 大纲与思维导图笔记（无账号，文档存本机，可同步到对象存储）",
+  "author": "理记",
+  "license": "UNLICENSED",
+  "private": true,
+  "main": "main.js",
+  "scripts": {
+    "start": "electron .",
+    "smoke": "electron . --smoke",
+    "dist": "electron-builder --win"
+  },
+  "build": {
+    "appId": "com.liji.notebook.win",
+    "productName": "理记 · 轻享版",
+    "copyright": "Copyright © 2026 理记",
+    "asar": true,
+    "compression": "maximum",
+    "files": [
+      "main.js",
+      "web/**/*"
+    ],
+    "directories": {
+      "output": "../dist",
+      "buildResources": "build"
+    },
+    "win": {
+      "icon": "build/icon.png",
+      "target": [
+        { "target": "portable", "arch": ["x64"] }
+      ]
+    },
+    "portable": {
+      "artifactName": "理记-轻享版-${version}.exe"
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "理记 · 轻享版",
+      "artifactName": "理记-轻享版-${version}-安装包.exe"
+    },
+    "publish": null
+  },
+  "devDependencies": {
+    "electron": "31.7.7",
+    "electron-builder": "24.13.3"
+  }
+}

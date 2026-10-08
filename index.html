@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <!-- 便于本地直接改文件后立刻看到效果：禁用强缓存 -->
+  <meta http-equiv="Cache-Control" content="no-store, must-revalidate" />
+  <meta http-equiv="Pragma" content="no-cache" />
+  <title>理记-轻享版</title>
+  <link rel="icon" type="image/svg+xml" href="/icon.svg" />
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <div id="desktop">
+    <div id="app"></div>
+  </div>
+  <!-- 对象存储客户端必须先于 app.js：app 启动就要读配置、算签名 -->
+  <script src="oss.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>

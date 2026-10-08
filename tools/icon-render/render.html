@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <title>icon render</title>
+  <style>html,body{margin:0;padding:0;background:transparent}#stage{position:absolute;left:0;top:0}</style>
+</head>
+<body>
+  <div id="stage"></div>
+  <script>
+    /* 把一段 SVG 源码渲染成指定尺寸的 PNG（data URL）。
+     * 走「Blob URL + <img>」而不是 createImageBitmap：
+     *   Chromium 的 createImageBitmap 不支持 SVG（会报 source image could not be decoded），
+     *   而 Blob URL 是同源的，画到 canvas 上不会污染画布，toDataURL 才拿得到数据。 */
+    window.__renderSvg = async function (svgText, size) {
+      const doc = new DOMParser().parseFromString(svgText, 'image/svg+xml');
+      const svg = doc.documentElement;
+      if (svg.nodeName === 'parsererror' || !svg.getAttribute('viewBox')) return 'ERR:解析 SVG 失败';
+
+      svg.setAttribute('width', size);
+      svg.setAttribute('height', size);
+      const src = new XMLSerializer().serializeToString(svg);
+
+      const url = URL.createObjectURL(new Blob([src], { type: 'image/svg+xml;charset=utf-8' }));
+      try {
+        const img = new Image();
+        img.width = size;
+        img.height = size;
+        const loaded = new Promise((resolve, reject) => {
+          img.onload = resolve;
+          img.onerror = () => reject(new Error('图像加载失败'));
+        });
+        img.src = url;
+        await loaded;
+
+        const canvas = document.createElement('canvas');
+        canvas.width = size;
+        canvas.height = size;
+        const ctx = canvas.getContext('2d');
+        ctx.clearRect(0, 0, size, size);
+        ctx.drawImage(img, 0, 0, size, size);
+        return canvas.toDataURL('image/png');
+      } catch (e) {
+        return 'ERR:' + e.message;
+      } finally {
+        URL.revokeObjectURL(url);
+      }
+    };
+  </script>
+</body>
+</html>
