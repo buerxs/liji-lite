@@ -5,21 +5,9 @@
 
 ---
 
-## 一、和正式版的差别
+## 一、网络行为
 
-| | 正式版 | 轻享版 |
-|---|---|---|
-| 账号 / 登录 / 会员 / 兑换码 | 有（走自建服务端） | **没有** |
-| 公告 / 联系我们 / 版本更新 | 有 | **没有** |
-| 后台管理（admin.html） | 有 | **没有** |
-| 文档存哪 | 本机 + 服务器 | **本机** |
-| 云端 | 自建服务端 | **你自己的对象存储** |
-| 文档 / 导图 / 公式 / 图片 / 文件夹 / 导出 | 有 | **完全一样** |
-| Markdown 导入 / 导出（2026-10-07） | 有 | **完全一样**（首页「⤓ 导入」+ 导出面板「文档 · Markdown」） |
-| 首页按钮改版 / 首主题一级 / 删除母主题子级归前一个母主题（2026-10-08） | 有 | **完全一样**（轻享版同样没有侧栏「＋ 新建文档」按钮） |
-| 免费版限制（3 篇 / 30 节点） | 有 | **没有限制**（导入同样不限篇数与主题数） |
-
-轻享版发出的网络请求只有一类：**去你自己的对象存储读写两个 JSON 文件**。
+本程序发出的网络请求只有一类：**去你配置的对象存储读写两个 JSON 文件**。
 不发任何 `/api` 请求（自检里有一条断言钉住这件事）。
 
 ---
@@ -37,22 +25,24 @@ node server.js         :: 只起服务，自己访问 http://127.0.0.1:5173
 > 不建议直接双击 `index.html`（`file://`）：那条路上 Web Crypto 可能被禁、localStorage 行为也不一致，
 > 对象存储签名会算不出来。
 
-### 公网网页版（Cloudflare Pages，手机随时可用，不依赖电脑）
+### 公网网页版（部署到静态托管，摆脱「同一局域网」限制）
 
-网页版托管在 **Cloudflare Pages**：**https://liji-web.pages.dev**（长期有效、自动 HTTPS、
-默认域名可直接渲染，手机浏览器打开即用，「添加到主屏幕」可当 App）。
+网页版是**纯静态**的——`index.html / app.js / oss.js / styles.css / icon.svg` 五个文件，
+把 `网页部署包\` 文件夹上传到任何静态网站托管，就能得到一个**不依赖电脑**的公网地址：
+手机 / 平板 / 任何设备随时可用，不需要电脑开机、也不需要和电脑连同一网络。
 
-更新网页（改了 index.html / app.js / styles.css / oss.js / icon.svg 之后）：
+作者自己长期用 **Cloudflare Pages**（免费、自动 HTTPS、默认域名可直接访问）：
 
-1. 同步这五个文件到本地 `网页部署包\` 文件夹（或叫我们重新打包）
-2. Cloudflare 控制台 → Workers & Pages → 该项目 → **Create new deployment** →
-   再拖一次 `网页部署包\` 文件夹，约 30 秒生效
+1. Cloudflare 控制台 → Workers & Pages → Create → Pages → **Upload assets** →
+   拖入 `网页部署包\` 文件夹，约 30 秒得到 `https://<项目名>.pages.dev`
+2. 以后改了文件：进该项目 → **Create new deployment** → 再拖一次文件夹即可
 
-> 为什么不是腾讯 COS 静态网站：实测两条路都被政策堵死——
-> ① 2024 年后新建的桶，XML API 默认域名对网页文件强制下载（`x-cos-force-download`）；
-> ② 静态网站默认域名只有 **3 小时**带 token 预览（加速区域含大陆），
->    不含大陆的加速区域大陆网络访问默认域名也 401。长期访问只能绑自定义域名（含大陆需备案）。
-> 阿里云 OSS 默认域名同样对大陆桶强制下载。网页托管请用 Cloudflare Pages / EdgeOne+自定义域名 等。
+作者维护的演示地址：**https://liji-web.pages.dev**（手机浏览器打开即用，
+「添加到主屏幕」可以当 App）。
+
+> 为什么不用国内对象存储当网站：2024 年后新建的腾讯 COS / 阿里云 OSS 桶，
+> 默认域名对网页文件**强制下载**；EdgeOne 默认域名只有 **3 小时**预览。
+> 长期稳定请用 Cloudflare Pages，或给 EdgeOne / COS 绑自定义域名（大陆节点需备案）。
 
 ---
 
@@ -72,6 +62,9 @@ node server.js         :: 只起服务，自己访问 http://127.0.0.1:5173
 - 手机走 `http://局域网IP` 不算安全上下文，Web Crypto 会被禁 ——
   `oss.js` 会自动落到内置的纯 JS 签名回退（离线自检对两条路都验过），功能不受影响；
 - 服务只在电脑开机、双击了 bat 之后存在；关掉「理记手机服务」窗口就停，文档不受影响。
+
+> 这个方案依赖电脑开机且同一局域网。想**彻底不依赖电脑**，用上一节的
+> 「公网网页版」——把 `网页部署包\` 传到静态托管即可，任何网络都能访问。
 
 ---
 
@@ -195,14 +188,14 @@ node tools/test-lite.js       :: 真浏览器端到端（Edge/Chrome 无头，46
 当前已打好：`dist/理记-轻享版-1.2.0.exe`（67.9 MB），打包时的冒烟自检
 源码态与成品 exe 各 14/14 通过，`tools/verify-asar.js` 确认包内文件与源码逐字节一致。
 
-> 打包依赖（`electron/node_modules`）没有随副本一起复制，`打包.bat` 第一次会先 `npm install`
-> （本机已装好，可直接 `node tools/build-exe.js` 重打）。
+> 打包依赖（`electron/node_modules`）没有入库，`打包.bat` 第一次会先 `npm install`
+> （也可直接 `node tools/build-exe.js` 重打）。
 
 ---
 
 ## 七、数据在哪 / 怎么清
 
-- 文档：浏览器 localStorage，键名 `liji_store:*`（与鸿蒙版、正式版互通，导出导入的 JSON 一样）
+- 文档：浏览器 localStorage，键名 `liji_store:*`
 - 对象存储配置：localStorage 的 `liji_oss_config`
 - 桌面端 exe：便携版落在 **exe 同级的 `理记数据\`**（换电脑把整个文件夹拷走就行）；
   只有 NSIS 安装版才用 `%APPDATA%\理记\data`。也可以用 `LIJI_DATA_DIR` 环境变量指定。
@@ -215,16 +208,13 @@ node tools/test-lite.js       :: 真浏览器端到端（Edge/Chrome 无头，46
 ## 八、文件说明
 
 ```
-index.html / app.js / styles.css   客户端（app.js 里文档功能与正式版一致）
+index.html / app.js / styles.css   客户端
 oss.js                             对象存储客户端：AWS SigV4 / 阿里云 OSS V1+V4 / 腾讯云 COS，零依赖
 server.js                          本地静态服务（无数据库、无接口；HOST=0.0.0.0 时供手机访问）
 启动.bat / 手机访问.bat             本机用 / 局域网给手机用（自检 / 诊断 / 打包 / 重置数据 同目录）
 electron/                          桌面端外壳（main.js 本地模式）
 tools/                             自检与打包脚本（make-bat.js 生成全部 .bat，勿直接编辑 .bat）
 ```
-
-正式版那三套界面自检（`test-ui.js` / `test-e2e.js` / `test-layout.js`）依赖登录页与服务端，
-轻享版用不上，已移除；原项目 `D:\LiJi-Cloud` 里的仍然可用。
 
 > `.bat` 脚本（启动 / 打包 / 自检 / 诊断 / 重置数据 / 手机访问）由 `tools/make-bat.js` 生成
 > （GBK + CRLF），不直接入库，克隆后跑 `node tools/make-bat.js` 生成；
