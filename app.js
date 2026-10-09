@@ -26,7 +26,7 @@
     return 'http://127.0.0.1:5173';
   })();
   const SERVER_HOST = SERVER_URL.replace(/^https?:\/\//, '');   // 只用于界面文案
-  const APP_VERSION = '1.3.0';        // 轻享版版本号（与 electron/package.json 保持一致）
+  const APP_VERSION = '1.3.1';        // 轻享版版本号（与 electron/package.json 保持一致）
   const ZWSP = '​';
   const LEVEL_FONT_ROOT = 18, LEVEL_FONT_TOP = 16, LEVEL_FONT_STEP = 1, LEVEL_FONT_MIN = 13;
   /* MAP_ROW 是「向下分类图 / 组织结构图」的**最小**层间距，不是固定层间距 ——
@@ -963,8 +963,10 @@
     });
     const prevMap = ossState.mirrorMap || {};
     const prevHashes = ossState.mirrorHashes || {};
-    const stillDead = (ossState.mirrorDead || []).slice();
+    const prevDead = (ossState.mirrorDead || []).slice();
+    const stillDead = [];      // 新名单：这次仍失败的才留下（成功/404 的摘掉，名单只减不增）
     let ups = 0, dels = 0, errs = 0;
+    const fails = [];          // 每项失败都要带上下文：删还是传、哪个 key、HTTP 几、服务端说了什么 —— 只报个数用户没法自救
     const newMap = {}, newHashes = {};
     /* 没变的直接继承（成功过的才会在 prevMap 里） */
     for (const id in desired) {
@@ -974,10 +976,10 @@
     }
     /* 上次没删掉的旧 key：重试；404 = 已经没了，也算成功 */
     const retried = {};
-    for (const key of stillDead) {
+    for (const key of prevDead) {
       retried[key] = true;
       try { await OSS.del(S.ossCfg, key); dels++; }
-      catch (e) { if (e.status !== 404) errs++; else dels++; }
+      catch (e) { if (e.status !== 404) { errs++; stillDead.push(key); fails.push({ op: 'del', key: key, status: e.status, msg: e.message }); } else dels++; }
     }
     /* 改名 / 移动：删旧 key（失败记入 dead 名单下次再删，**不能**当删成功记账） */
     for (const id in prevMap) {
@@ -986,7 +988,7 @@
       if (retried[prevMap[id]]) continue;
       try { await OSS.del(S.ossCfg, prevMap[id]); dels++; }
       catch (e) {
-        if (e.status !== 404) { errs++; stillDead.push(prevMap[id]); }
+        if (e.status !== 404) { errs++; stillDead.push(prevMap[id]); fails.push({ op: 'del', key: prevMap[id], status: e.status, msg: e.message }); }
       }
     }
     /* 上传：失败**不记账**（不进 newMap）→ 下次同步自动重试 */
@@ -995,19 +997,35 @@
       const d = S.documents.filter(x => String(x.id) === String(id))[0];
       if (!d) continue;
       try { await OSS.put(S.ossCfg, desired[id], docToMarkdown(d)); ups++; newMap[id] = desired[id]; newHashes[id] = hashes[id]; }
-      catch (e) { errs++; }
+      catch (e) { errs++; fails.push({ op: 'put', key: desired[id], status: e.status, msg: e.message }); }
     }
     ossState.mirrorMap = newMap;
     ossState.mirrorHashes = newHashes;
     ossState.mirrorDead = stillDead;
     if (ups || dels || errs) saveOssState();
-    return { ups: ups, dels: dels, errs: errs };
+    return { ups: ups, dels: dels, errs: errs, fails: fails };
   }
   /* 推送收尾的镜像 + 日志上传：失败**不影响**正常同步（数据已经上去了），只记日志下次重试 */
   async function syncMirrorQuiet(OSS) {
     try {
       const r = await syncMirror(OSS);
-      if (r && r.errs) logOp('同步', '源文件镜像有 ' + r.errs + ' 个文件没传上，下次同步重试');
+      if (r && r.errs) {
+        /* ★ 只报「N 个没传上」用户没法自救 —— 必须带上第一项失败的动作 / key / 状态码 / 原因。
+         *   status 0 = 请求根本没发出去（跨域 CORS 没放行 PUT / DELETE 是头号成因，删旧 key 常中招）；
+         *   403 = 签名或密钥；404 不算失败（上一行已处理）。 */
+        const pre = (S.ossCfg && S.ossCfg.prefix) || '';
+        const f = (r.fails && r.fails[0]) || null;
+        let detail = '';
+        if (f) {
+          const k = f.key.indexOf(pre) === 0 ? f.key.slice(pre.length) : f.key;
+          const why = (f.status === 0 || f.status === undefined)
+            ? '连不上（跨域 CORS 多半没放行 ' + (f.op === 'del' ? 'DELETE' : 'PUT') + '，去桶的跨域设置补上）'
+            : 'HTTP ' + f.status + ' ' + String(f.msg || '').slice(0, 90);
+          detail = '（' + (f.op === 'del' ? '删 ' : '传 ') + k + '：' + why
+            + (r.errs > 1 ? '；其余 ' + (r.errs - 1) + ' 项略' : '') + '）';
+        }
+        logOp('同步', '源文件镜像有 ' + r.errs + ' 个文件没同步上' + detail + '，下次同步重试');
+      }
       return r;
     } catch (e) {
       logOp('同步', '源文件镜像更新失败：' + (e.message || e));

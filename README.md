@@ -199,7 +199,7 @@ node tools/test-lite.js       :: 真浏览器端到端（Edge/Chrome 无头，�
 产物 `dist/理记-轻享版-<版本>.exe`，双击即用，不需要 Node。
 桌面端是**本地模式**：内嵌静态服务 + 加载包内页面，不联网可用。
 
-当前已打好：`dist/理记-轻享版-1.3.0.exe`（67.9 MB），打包时的冒烟自检
+当前已打好：`dist/理记-轻享版-1.3.1.exe`（67.9 MB），打包时的冒烟自检
 源码态与成品 exe 各 14/14 通过，`tools/verify-asar.js` 确认包内文件与源码逐字节一致。
 
 > 打包依赖（`electron/node_modules`）没有入库，`打包.bat` 第一次会先 `npm install`

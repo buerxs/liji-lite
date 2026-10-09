@@ -700,6 +700,58 @@ function makeCdp(wsUrl) {
   check('操作日志按设备上传到桶 logs/ 目录', logUploaded.some(k => k.indexOf('liji/logs/') === 0),
     logUploaded.filter(k => k.indexOf('liji/logs/') === 0).join(' , '));
 
+  /* 4b) 对照：镜像失败不能只说「没传上」——必须带 删/传、key、状态码，用户才能自救
+   *     （真机案例：文档同步一直好，日志却反复「N 个没传上」，一查全是删旧 key 403/跨域）。
+   *     注入 DELETE 全 403 → 删文档（旧 .md 删不掉）→ 日志必须点名；
+   *     解除注入 → 下次同步 dead 名单自动重试，桶里旧 key 收敛消失。 */
+  srv.setFailDel('liji/docs/');
+  const faultTitle = await cdp.eval(`
+    var L = window.__liji;
+    L.createDocument('故障注入文档');
+    var d = L.S.documents[L.S.documents.length - 1];
+    L.moveDocTo(d.id, L.S.folders.filter(function (f) { return f.name === '测试分类'; })[0].id);
+    return { id: d.id, title: d.title };`);
+  const faultKey = 'liji/docs/测试分类/' + faultTitle.title + '.md';
+  await cdp.eval(`window.__liji.syncNow(); return true;`);
+  await waitDump(keys => keys.indexOf(faultKey) >= 0, 15000);   // 先让 PUT 落桶（PUT 未被注入）
+  check('故障前置：移动后的 .md 已在桶里（PUT 不受注入影响）',
+    dumpDecoded().indexOf(faultKey) >= 0, dumpDecoded().filter(k => k.indexOf('liji/docs/') === 0).join(' , '));
+  await cdp.eval(`window.__liji.deleteDocument(${faultTitle.id}); window.__liji.syncNow(); return true;`);
+  let faultLog = '';
+  {
+    const deadline = Date.now() + 15000;
+    while (Date.now() < deadline) {
+      faultLog = await cdp.eval(`
+        var arr = window.__liji.opLog().filter(function (x) {
+          return x.e === '同步' && x.d.indexOf('没同步上') >= 0 && x.d.indexOf('docs/测试分类/故障注入文档.md') >= 0;
+        });
+        return arr.length ? arr[arr.length - 1].d : '';`);
+      if (faultLog) break;
+      await sleep(300);
+    }
+    if (!faultLog) {
+      faultLog = '(15s 内未出现本 key 的失败条目) 现场: ' + await cdp.eval(`
+        var arr = window.__liji.opLog().filter(function (x) { return x.e === '同步'; }).slice(-5).map(function (x) { return x.d; });
+        var st = null; try { st = JSON.parse(localStorage.getItem('liji_oss_state') || 'null'); } catch (e) {}
+        return JSON.stringify({ log: arr, dead: st ? st.mirrorDead : null });`);
+    }
+  }
+  check('镜像删失败 → 日志点名「删哪个 key + HTTP 403」而不是只说没传上',
+    faultLog.indexOf('删 ') >= 0 && faultLog.indexOf('docs/测试分类/' + faultTitle.title + '.md') >= 0 && faultLog.indexOf('403') >= 0,
+    faultLog || '(日志里没有失败条目)');
+  srv.setFailDel('');
+  await cdp.eval(`window.__liji.syncNow(); return true;`);
+  let deadCleared = false;
+  {
+    const deadline = Date.now() + 15000;
+    while (Date.now() < deadline) {
+      if (dumpDecoded().indexOf(faultKey) < 0) { deadCleared = true; break; }
+      await sleep(300);
+    }
+  }
+  check('解除故障后下次同步自动重试，旧 key 从桶里收敛消失', deadCleared,
+    dumpDecoded().filter(k => k.indexOf('liji/docs/') === 0).join(' , '));
+
   /* 5) UI：设置页两张新卡 + 日志浮层 */
   const uiCards = await cdp.eval(`
     var L = window.__liji;

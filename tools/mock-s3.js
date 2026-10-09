@@ -136,7 +136,7 @@ async function start(port) {
    * versioning 关着时 PUT 覆盖单条、DELETE 清空；开着时 PUT 追加、DELETE 追加删除标记，
    * 与真实桶的行为一致 —— 回收站的「列删除标记 / 读旧版本 / 删指定版本」就在这条链路上验。 */
   const store = new Map();
-  const state = { versioning: false };
+  const state = { versioning: false, failPutPrefix: '', failDelPrefix: '' };
   let vidSeq = 0;
   /* ★ S3 语义：对象是否「活着」只看**最后一条**——是删除标记就是删除态，
      不存在「跳过标记拿旧版本」这种读法（旧版本只能靠 versionId 读）。 */
@@ -178,6 +178,15 @@ async function start(port) {
       const key = url.pathname.replace(/^\/+/, '').replace(/^[^/]+\//, '');
       const vid = url.searchParams.get('versionId');
       const wantVersions = url.searchParams.has('versions');
+
+      /* 故障注入（对照实验用）：命中前缀的 PUT / DELETE 一律 403，
+       * 用来验证「镜像失败必须把 删/传 + key + 状态码 写进日志」以及 dead 名单的重试闭环。 */
+      const failHit = m => (state.failPutPrefix && m === 'PUT' && key.indexOf(state.failPutPrefix) === 0)
+        || (state.failDelPrefix && m === 'DELETE' && key.indexOf(state.failDelPrefix) === 0);
+      if (failHit(req.method)) {
+        res.writeHead(403, Object.assign({ 'Content-Type': 'application/xml' }, CORS));
+        return res.end(xmlError('AccessDenied', 'injected failure (mock fault switch)'));
+      }
 
       /* 桶级列举（GET /bucket/?versions&prefix=…）—— 回收站的列表与版本探测走这里。
        * ★ 与真桶同口径：versions 列举只在 key 路径为空时成立（prefix 走 query），
@@ -246,6 +255,9 @@ async function start(port) {
     dump: () => Array.from(store.keys()),
     setVersioning: v => { state.versioning = !!v; },
     versioning: () => state.versioning,
+    /* 故障注入开关：传 key 前缀（如 'liji/docs/'）开启，传空串关闭 */
+    setFailPut: p => { state.failPutPrefix = String(p || ''); },
+    setFailDel: p => { state.failDelPrefix = String(p || ''); },
     close: () => new Promise(r => srv.close(r))
   };
 }
