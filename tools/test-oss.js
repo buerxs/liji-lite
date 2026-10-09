@@ -188,6 +188,40 @@ function check(name, got, want) {
   check('V4 authorization 不带 AdditionalHeaders（x-oss-* 本就自动参与）',
     String(v4out.authorization.indexOf('AdditionalHeaders') === -1), 'true');
 
+  /* ③ 中文 key：V1 的 CanonicalizedResource 用**解码后**的原始 key（2026-10-09 真桶对拍）：
+   *    服务端先把收到的 URL 路径 decode 再验签 —— 按编码路径签，ASCII 碰巧相等、中文必 403。 */
+  const cjkPath = '/lij/docs/' + encodeURIComponent('粉笔') + '/' + encodeURIComponent('团圆-三九胃泰') + '.md';
+  const cjkUrl = 'https://liji-docx.oss-cn-hangzhou.aliyuncs.com' + '/liji-docx' + cjkPath;
+  const v1cjk = await OSS._sign.signOssV1(ossCfg, 'PUT',
+    cjkUrl, cjkPath, {},
+    { 'content-type': 'application/json; charset=utf-8' }, '', ossNow);
+  const m1c = /OSS AKexample:(.+)$/.exec(v1cjk.authorization);
+  const v1cjkStsOk = 'PUT\n\napplication/json; charset=utf-8\n' + ossDate + '\nx-oss-date:' + ossDate
+    + '\n/liji-docx/lij/docs/粉笔/团圆-三九胃泰.md';
+  check('OSS V1 中文 key（CanonicalizedResource 用解码原始 key）',
+    m1c ? m1c[1] : v1cjk.authorization,
+    nodeCrypto.createHmac('sha1', 'secret/plus').update(v1cjkStsOk).digest('base64'));
+  const v1cjkStsOld = 'PUT\n\napplication/json; charset=utf-8\n' + ossDate + '\nx-oss-date:' + ossDate + '\n' + cjkPath;
+  check('对照：按编码路径签中文 key 的旧写法签名必须不同',
+    String(m1c[1] !== nodeCrypto.createHmac('sha1', 'secret/plus').update(v1cjkStsOld).digest('base64')), 'true');
+  /* V4 相反：Canonical URI 就用**编码后**路径（真桶验证过中文 PUT OK），别跟 V1 互相照抄 */
+  const v4cjk = await OSS._sign.signOssV4(ossCfg, 'PUT',
+    cjkUrl, cjkPath, {},
+    { 'content-type': 'application/json; charset=utf-8' }, '', ossNow);
+  const m4c = /Signature=([0-9a-f]{64})$/.exec(v4cjk.authorization);
+  const v4cjkCr = ['PUT', '/liji-docx' + cjkPath, '',
+    'content-type:application/json; charset=utf-8\nx-oss-content-sha256:UNSIGNED-PAYLOAD\nx-oss-date:' + ossTs + '\n',
+    '', 'UNSIGNED-PAYLOAD'].join('\n');
+  const v4cjkSts = ['OSS4-HMAC-SHA256', ossTs, '20261007/cn-hangzhou/oss/aliyun_v4_request',
+    nodeCrypto.createHash('sha256').update(v4cjkCr).digest('hex')].join('\n');
+  let v4cjkKey = nodeCrypto.createHmac('sha256', 'aliyun_v4secret/plus').update('20261007').digest();
+  for (const p of ['cn-hangzhou', 'oss', 'aliyun_v4_request']) {
+    v4cjkKey = nodeCrypto.createHmac('sha256', v4cjkKey).update(p).digest();
+  }
+  check('OSS V4 中文 key（Canonical URI 用编码路径，与 V1 相反）',
+    m4c ? m4c[1] : v4cjk.authorization,
+    nodeCrypto.createHmac('sha256', v4cjkKey).update(v4cjkSts).digest('hex'));
+
   console.log('\n' + (fail === 0 ? '全部通过' : fail + ' 项失败'));
   process.exit(fail === 0 ? 0 : 1);
 })();

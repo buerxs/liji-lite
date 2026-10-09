@@ -328,7 +328,12 @@
      *   按 key 排序、有值带值无值只写 key —— prefix / max-keys 这类普通 query 参数**不进**签名。
      *   （2026-10-09 真桶验证抓到：第一版把全部 query 都拼进去，?versions 一上就 SignatureDoesNotMatch。
      *   注意这与 S3 SigV4 / 阿里 V4 的「全量 query 参与签名」口径相反，别互相照抄。） */
-    let resource = '/' + c.bucket + cpath;
+    /* ★ CanonicalizedResource 里的对象路径用**解码后**的原始 key（服务端先把收到的
+     *   URL 路径 decode 再验签）：ASCII key 编码前后恰好相等，所以纯英文名一直没暴露；
+     *   中文 / 空格 / 全角字符的 key 按编码路径签就是 403 SignatureDoesNotMatch
+     *   （2026-10-09 源文件镜像全线失败踩到，真桶变体对拍确认：编码签 403、解码签 OK）。
+     *   bucket 段是字母数字与连字符，解码不受影响。 */
+    let resource = '/' + c.bucket + decodeURIComponent(cpath);
     const SUBRES = {};
     ['acl', 'uploads', 'location', 'cors', 'logging', 'website', 'referer', 'lifecycle', 'delete',
       'append', 'tagging', 'objectMeta', 'uploadId', 'partNumber', 'security-token', 'position',

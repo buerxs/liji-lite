@@ -233,6 +233,33 @@ function check(name, cond, extra) {
     check('V1 签名确实包含子资源（与无 query 版本不同）', sigA !== sigNoQ);
   }
 
+  /* 12) 中文 key 真实往返（2026-10-09 源文件镜像踩坑的回归防线）：
+   *    源文件镜像的 key 全是中文（docs/文件夹/文档名.md）。阿里 V1 当时就挂在这 ——
+   *    ASCII 碰巧能过、中文必 403。这里用真实 mock server 把三家的中文 key 全走一遍读写删。 */
+  console.log('===== 中文 key 往返（S3 / COS，真实 HTTP 验签）=====');
+  srv.setVersioning(false);
+  const s3cjk = OSS.normalize({
+    provider: 's3', endpoint: srv.url, bucket: 'b1', region: 'r1',
+    ak: srv.accessKey, sk: srv.secretKey, prefix: 'liji/', pathStyle: true
+  });
+  const cjkKey = 'docs/粉笔/团圆-三九胃泰（1）.md';
+  let cjkErr = '';
+  try {
+    await OSS.put(s3cjk, cjkKey, '# 中文内容');
+    const got = await OSS.get(s3cjk, cjkKey);
+    if (got.text !== '# 中文内容') cjkErr = '往返内容不一致: ' + got.text;
+    await OSS.del(s3cjk, cjkKey);
+  } catch (e) { cjkErr = e.message; }
+  check('S3 中文 key（空格+全角括号）读写删往返', cjkErr === '', cjkErr);
+  let cosCjkErr = '';
+  try {
+    await OSS.put(cosSrvCfg, cjkKey, '# 中文内容');
+    const got = await OSS.get(cosSrvCfg, cjkKey);
+    if (got.text !== '# 中文内容') cosCjkErr = '往返内容不一致: ' + got.text;
+    await OSS.del(cosSrvCfg, cjkKey);
+  } catch (e) { cosCjkErr = e.message; }
+  check('COS 中文 key（空格+全角括号）读写删往返', cosCjkErr === '', cosCjkErr);
+
   await srv.close();
   console.log('\n' + (fail === 0 ? '全部通过' : fail + ' 项失败'));
   process.exit(fail === 0 ? 0 : 1);

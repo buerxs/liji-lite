@@ -240,7 +240,7 @@
   /* 本机记住的「云端版本」：{ syncedAt, remoteUpdatedAt, rev, base } —— 启动比对就看这几个数。
      它自己也要落盘：不落盘的话，重启后就不知道上次同步到哪，只能盲目拿云端盖本地。
      rev = 云端 meta 的版本号（乐观锁）；base = 上次同步时每篇文档的内容指纹（三方合并的「共同祖先」）。 */
-  let ossState = { syncedAt: 0, remoteUpdatedAt: 0, device: '', rev: 0, base: null, mirrorMap: null, mirrorHashes: null };
+  let ossState = { syncedAt: 0, remoteUpdatedAt: 0, device: '', rev: 0, base: null, mirrorMap: null, mirrorHashes: null, mirrorDead: [] };
   let pollTimer = -1;
 
   /* ============================== DOM 工具 ============================== */
@@ -450,9 +450,16 @@
       ossState.rev = Number(st.rev) || 0;
       ossState.base = (st.base && typeof st.base === 'object') ? st.base : null;
       /* .md 镜像的「上次推了什么」也要落盘（docId → 桶里 key / 内容指纹），
-         否则刷新后丢基准：改名/删除的旧文件删不掉，内容变没变也判断不出。 */
-      ossState.mirrorMap = (st.mirrorMap && typeof st.mirrorMap === 'object') ? st.mirrorMap : null;
-      ossState.mirrorHashes = (st.mirrorHashes && typeof st.mirrorHashes === 'object') ? st.mirrorHashes : null;
+         否则刷新后丢基准：改名/删除的旧文件删不掉，内容变没变也判断不出。
+         ★ mirrorVer：2026-10-09 之前的版本把「传失败的」也记成了「已传」（签名 bug 期间的坏账），
+           靠版本号强制重镜像一次——传过的有内容指纹挡着，只补缺的，不会重复上传。 */
+      if (Number(st.mirrorVer) === 2) {
+        ossState.mirrorMap = (st.mirrorMap && typeof st.mirrorMap === 'object') ? st.mirrorMap : null;
+        ossState.mirrorHashes = (st.mirrorHashes && typeof st.mirrorHashes === 'object') ? st.mirrorHashes : null;
+        ossState.mirrorDead = Array.isArray(st.mirrorDead) ? st.mirrorDead : [];
+      } else {
+        ossState.mirrorMap = null; ossState.mirrorHashes = null; ossState.mirrorDead = [];
+      }
     } catch (e) { }
   }
   function saveOssConfig() {
@@ -462,7 +469,7 @@
     } catch (e) { showNotice('对象存储配置没能存到本机（本机存储可能已满）'); }
   }
   function saveOssState() {
-    try { localStorage.setItem(OSS_STATE_KEY, JSON.stringify(ossState)); } catch (e) { }
+    try { localStorage.setItem(OSS_STATE_KEY, JSON.stringify(Object.assign({}, ossState, { mirrorVer: 2 }))); } catch (e) { }
   }
   function dateText(ts) {
     if (!ts) return '';
@@ -956,22 +963,43 @@
     });
     const prevMap = ossState.mirrorMap || {};
     const prevHashes = ossState.mirrorHashes || {};
+    const stillDead = (ossState.mirrorDead || []).slice();
     let ups = 0, dels = 0, errs = 0;
-    for (const id in prevMap) {
-      if (desired[id] !== prevMap[id]) {
-        try { await OSS.del(S.ossCfg, prevMap[id]); dels++; }
-        catch (e) { if (e.status !== 404) errs++; }
+    const newMap = {}, newHashes = {};
+    /* 没变的直接继承（成功过的才会在 prevMap 里） */
+    for (const id in desired) {
+      if (prevMap[id] === desired[id] && prevHashes[id] === hashes[id]) {
+        newMap[id] = desired[id]; newHashes[id] = hashes[id];
       }
     }
+    /* 上次没删掉的旧 key：重试；404 = 已经没了，也算成功 */
+    const retried = {};
+    for (const key of stillDead) {
+      retried[key] = true;
+      try { await OSS.del(S.ossCfg, key); dels++; }
+      catch (e) { if (e.status !== 404) errs++; else dels++; }
+    }
+    /* 改名 / 移动：删旧 key（失败记入 dead 名单下次再删，**不能**当删成功记账） */
+    for (const id in prevMap) {
+      if (newMap[id] !== undefined) continue;
+      if (desired[id] === prevMap[id]) continue;        // key 没变（内容变了）→ 走下面的 put
+      if (retried[prevMap[id]]) continue;
+      try { await OSS.del(S.ossCfg, prevMap[id]); dels++; }
+      catch (e) {
+        if (e.status !== 404) { errs++; stillDead.push(prevMap[id]); }
+      }
+    }
+    /* 上传：失败**不记账**（不进 newMap）→ 下次同步自动重试 */
     for (const id in desired) {
-      if (prevMap[id] === desired[id] && prevHashes[id] === hashes[id]) continue;
+      if (newMap[id] !== undefined) continue;
       const d = S.documents.filter(x => String(x.id) === String(id))[0];
       if (!d) continue;
-      try { await OSS.put(S.ossCfg, desired[id], docToMarkdown(d)); ups++; }
+      try { await OSS.put(S.ossCfg, desired[id], docToMarkdown(d)); ups++; newMap[id] = desired[id]; newHashes[id] = hashes[id]; }
       catch (e) { errs++; }
     }
-    ossState.mirrorMap = desired;
-    ossState.mirrorHashes = hashes;
+    ossState.mirrorMap = newMap;
+    ossState.mirrorHashes = newHashes;
+    ossState.mirrorDead = stillDead;
     if (ups || dels || errs) saveOssState();
     return { ups: ups, dels: dels, errs: errs };
   }
