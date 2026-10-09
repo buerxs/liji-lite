@@ -155,6 +155,84 @@ function check(name, cond, extra) {
    * 腾讯 COS 默认域名对新桶强制下载（x-cos-force-download），静态网站默认域名又只有
    * 3 小时带 token 预览，两条路都走不通，相关用例一并删除。 */
 
+  /* 11) 版本控制 / 回收站（2026-10-09）：mock 桶开版本控制 → 探测/列举/读旧版本/删指定版本全链路 */
+  console.log('===== 版本控制 / 回收站（S3 与 COS 各一遍）=====');
+  srv.setVersioning(true);
+  const pvOn = await OSS.probeVersioning(cfg);
+  check('版本控制探测：开着 → true', pvOn === true, String(pvOn));
+  /* 写两版再删 → GET 404；列举能看到 2 个版本 + 1 个删除标记；读旧版本能拿回内容 */
+  await OSS.put(cfg, 'docs/工作/计划.md', '# v1');
+  await OSS.put(cfg, 'docs/工作/计划.md', '# v2');
+  await OSS.del(cfg, 'docs/工作/计划.md');
+  check('删除后 GET 404（版本控制开着 = 打了删除标记）',
+    await OSS.get(cfg, 'docs/工作/计划.md').then(() => false, e => e.status === 404));
+  const lv = await OSS.listVersions(cfg, 'docs/');
+  const mine = lv.filter(x => x.key === 'liji/docs/工作/计划.md');
+  check('列举带配置前缀的 key（2 版本 + 1 标记）', mine.length === 3, JSON.stringify(mine));
+  check('最新态是删除标记', mine.filter(x => x.isLatest)[0] && mine.filter(x => x.isLatest)[0].marker === true);
+  check('旧版本可读（isLatest=false 的 Version）',
+    mine.some(x => !x.marker && x.isLatest === false && x.lastModified > 0), JSON.stringify(mine));
+  const oldV = mine.filter(x => !x.marker).sort((a, b) => b.lastModified - a.lastModified)[1];
+  check('存在可读的旧版本', !!oldV, JSON.stringify(mine));
+  if (!oldV) { console.log('全部通过'.replace('全部通过', fail + ' 项失败')); process.exit(1); }
+  const gotOld = await OSS.getVersion(cfg, 'docs/工作/计划.md', oldV.versionId);
+  check('按 versionId 读回第一版内容', gotOld.text === '# v1', gotOld.text);
+  /* 删指定版本（摘掉删除标记）→ 对象复活，GET 回到最新版本内容 */
+  const markerEntry = mine.filter(x => x.marker)[0];
+  await OSS.delVersion(cfg, 'docs/工作/计划.md', markerEntry.versionId);
+  const revived = await OSS.get(cfg, 'docs/工作/计划.md');
+  check('摘掉删除标记后对象复活（内容=最新版本）', revived.text === '# v2', revived.text);
+  /* 版本控制关着：探测必须判「没开」（应用据此提示用户去开） */
+  srv.setVersioning(false);
+  await OSS.put(cfg, 'docs/temp.md', 'x');
+  await OSS.del(cfg, 'docs/temp.md');
+  const pvOff = await OSS.probeVersioning(cfg);
+  check('版本控制探测：没开 → false', pvOff === false, String(pvOff));
+  /* COS：q-url-param-list 修复（旧代码恒为空，?versions 一上必 403）走真实 HTTP 验签 */
+  const cosSrvCfg = OSS.normalize({
+    provider: 'cos', endpoint: srv.url, bucket: 'cos-bucket-1250000000',
+    region: 'ap-guangzhou', ak: srv.cosAccessKey, sk: srv.cosSecretKey, prefix: 'liji/', pathStyle: true
+  });
+  srv.setVersioning(true);
+  const pvCos = await OSS.probeVersioning(cosSrvCfg);
+  check('COS 版本控制探测（验证 q-url-param-list 修复）', pvCos === true, String(pvCos));
+  let cosList = null;
+  try {
+    await OSS.put(cosSrvCfg, 'docs/a.md', '# cos');
+    await OSS.del(cosSrvCfg, 'docs/a.md');
+    cosList = await OSS.listVersions(cosSrvCfg, 'docs/');
+  } catch (e) { cosList = { err: e.message }; }
+  const cosA = Array.isArray(cosList) ? cosList.filter(x => x.key === 'liji/docs/a.md') : [];
+  check('COS 列举版本 + 删除标记', cosA.length === 2
+    && cosA.filter(x => x.marker).length === 1, JSON.stringify(cosList));
+  const cosNonMarker = cosA.filter(x => !x.marker).sort((a, b) => b.lastModified - a.lastModified)[0];
+  const cosVer = await OSS.getVersion(cosSrvCfg, 'docs/a.md', cosNonMarker.versionId);
+  check('COS 按 versionId 读回内容', cosVer.text === '# cos', cosVer.text);
+  /* 对照实验：打断 signOssV1 的子资源拼接，同一请求的签名必须**改变**——
+   * 证明 query 真的参与了 V1 签名（符合阿里规范的最终判据是真桶 403 回显对拍，见 test-oss.js 基线）。
+   * ★ 注：mock 只实现了 SigV4 与 COS 验签，阿里 V1 的「签得过」只能靠真桶，所以这里用离线对照。 */
+  {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'oss.js'), 'utf8');
+    const anchor = "const subKeys = Object.keys(query || {}).filter(k => query[k] !== undefined && query[k] !== null).sort();";
+    check('对照实验锚点唯一', src.split(anchor).length === 2);
+    const broken = src.replace(anchor, 'const subKeys = [];');
+    const mk = code => {
+      const w = {};
+      new Function('window', 'crypto', 'btoa', 'atob', 'TextEncoder', 'URL', 'fetch', code)(
+        w, globalThis.crypto, globalThis.btoa, globalThis.atob, TextEncoder, URL, globalThis.fetch);
+      return w.LiJiOSS;
+    };
+    const OSSA = mk(src), OSSB = mk(broken);
+    const ocfg = { provider: 'oss', endpoint: 'https://b.example', bucket: 'b1', region: 'cn-hangzhou', ak: 'ak', sk: 'sk', prefix: 'liji/', ossSign: 'v1' };
+    const u = new URL('https://b.example/liji/');
+    const q = { 'versions': '', 'max-keys': '1000', 'prefix': 'docs/' };
+    const sigA = (await OSSA._sign.signOssV1(ocfg, 'GET', u, '/b1/liji/', q, {}, 'H')).authorization;
+    const sigB = (await OSSB._sign.signOssV1(ocfg, 'GET', u, '/b1/liji/', q, {}, 'H')).authorization;
+    check('对照实验：打断 V1 子资源拼接 → 签名必变', sigA !== sigB);
+    const sigNoQ = (await OSSA._sign.signOssV1(ocfg, 'GET', u, '/b1/liji/', {}, {}, 'H')).authorization;
+    check('V1 签名确实包含子资源（与无 query 版本不同）', sigA !== sigNoQ);
+  }
+
   await srv.close();
   console.log('\n' + (fail === 0 ? '全部通过' : fail + ' 项失败'));
   process.exit(fail === 0 ? 0 : 1);

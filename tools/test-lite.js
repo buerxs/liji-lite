@@ -633,6 +633,121 @@ function makeCdp(wsUrl) {
   await cdp.eval(`window.__liji.S.documents = window.__liji.S.documents.filter(function (d) { return d.id !== 9527; });
     window.__liji.S.activeDocId = window.__liji.S.documents.length ? window.__liji.S.documents[0].id : 0; return true;`);
 
+  /* ---------- ⑫⅓ .md 镜像 / 操作日志 / 回收站（2026-10-09）----------
+   * 三件新功能走真链路：真推送 → 真桶（mock）→ 真浮层。
+   * 镜像与日志的断言直接看桶里有什么（srv.dump 是唯一事实源），
+   * 回收站走「开版本控制 → 删文档 → 列删除标记 → 恢复成副本」整条用户路径。 */
+  console.log('\n----- .md 镜像 · 操作日志 · 回收站 -----');
+  await cdp.eval(`
+    window.__liji.ossSaveConfig({ provider:'s3', endpoint: ${JSON.stringify(srv.url)}, region:'cn-north-1',
+      bucket:'liji-bucket', ak: ${JSON.stringify(srv.accessKey)}, sk: ${JSON.stringify(srv.secretKey)},
+      prefix:'liji/', pathStyle:true });
+    return true;`);
+  await cdp.waitFor(`return window.__liji.S.cloudState === 'synced';`, 15000);
+
+  const dumpDecoded = () => srv.dump().map(k => { try { return decodeURIComponent(k); } catch (e) { return k; } });
+  const waitDump = async (fn, ms) => {
+    const deadline = Date.now() + (ms || 12000);
+    while (Date.now() < deadline) {
+      const keys = dumpDecoded();
+      if (fn(keys)) return keys;
+      await sleep(300);
+    }
+    return dumpDecoded();
+  };
+
+  /* 1) 镜像：推送后每篇文档都有 .md */
+  const mirrorKeys = await waitDump(keys => keys.some(k => k.indexOf('liji/docs/') === 0 && k.slice(-3) === '.md'));
+  check('推送后桶里出现 .md 源文件镜像', mirrorKeys.some(k => k.indexOf('liji/docs/') === 0 && k.slice(-3) === '.md'),
+    mirrorKeys.filter(k => k.indexOf('liji/docs/') === 0).slice(0, 6).join(' , '));
+
+  /* 2) 文件夹分类：走真实「新建文件夹」入口 → 移动 → 桶里出现 文件夹/文档.md */
+  const mvInfo = await cdp.eval(`
+    var L = window.__liji;
+    if (!L.S.folders.some(function (f) { return f.name === '测试分类'; })) {
+      L.S.folderInput = '测试分类'; L.S.folderEditId = 0; L.submitFolderName();
+    }
+    var f = null;
+    L.S.folders.forEach(function (x) { if (x.name === '测试分类') f = x; });
+    if (!f) return { err: 'no folder' };
+    var d = L.S.documents[L.S.documents.length - 1];
+    L.moveDocTo(d.id, f.id);
+    return { id: d.id, title: d.title };`);
+  const folderKey = 'liji/docs/测试分类/' + mvInfo.title + '.md';
+  await waitDump(keys => keys.indexOf(folderKey) >= 0);
+  check('移动进文件夹 → 桶里出现「文件夹/文档.md」', dumpDecoded().indexOf(folderKey) >= 0,
+    dumpDecoded().filter(k => k.indexOf('liji/docs/') === 0).join(' , '));
+
+  /* 3) 删除文档 → 镜像跟着删（版本控制没开，直接消失） */
+  await cdp.eval(`window.__liji.deleteDocument(${mvInfo.id}); return true;`);
+  await waitDump(keys => keys.indexOf(folderKey) < 0);
+  check('删除文档 → 桶里的 .md 源文件也删掉', dumpDecoded().indexOf(folderKey) < 0, folderKey);
+
+  /* 4) 操作日志：本机记录 + 按设备上桶 */
+  const logCheck = await cdp.eval(`
+    var L = window.__liji;
+    var evs = L.opLog().map(function (x) { return x.e; });
+    return { n: L.opLog().length,
+      hasNew: evs.indexOf('新建文档') >= 0,
+      hasDel: evs.indexOf('删除文档') >= 0,
+      hasMove: evs.indexOf('移动文档') >= 0,
+      hasFolder: evs.indexOf('新建文件夹') >= 0,
+      hasSync: evs.indexOf('启动同步') >= 0 || evs.indexOf('手动同步') >= 0 };`);
+  check('操作日志记录了新建/删除/移动/文件夹/同步事件',
+    logCheck.hasNew && logCheck.hasDel && logCheck.hasMove && logCheck.hasFolder && logCheck.hasSync,
+    JSON.stringify(logCheck));
+  const logUploaded = await waitDump(keys => keys.some(k => k.indexOf('liji/logs/') === 0 && k.slice(-6) === '.jsonl'));
+  check('操作日志按设备上传到桶 logs/ 目录', logUploaded.some(k => k.indexOf('liji/logs/') === 0),
+    logUploaded.filter(k => k.indexOf('liji/logs/') === 0).join(' , '));
+
+  /* 5) UI：设置页两张新卡 + 日志浮层 */
+  const uiCards = await cdp.eval(`
+    var L = window.__liji;
+    L.S.showEditor = false; L.S.tab = '个人中心'; L.render();
+    var t = document.body.innerText || '';
+    return { hasRecycle: t.indexOf('回收站') >= 0, hasLog: t.indexOf('操作日志') >= 0 };`);
+  check('设置页有「回收站」与「操作日志」卡片', uiCards.hasRecycle === true && uiCards.hasLog === true, JSON.stringify(uiCards));
+  await cdp.eval(`window.__liji.S.showOpLog = true; window.__liji.render(); return true;`);
+  const logRows = await cdp.waitFor(`return document.querySelectorAll('.oplog-row').length;`, 6000);
+  check('日志浮层列出操作记录（最新在前）', logRows.ok === true && logRows.last > 0, JSON.stringify(logRows.last));
+  await cdp.eval(`window.__liji.S.showOpLog = false; window.__liji.render(); return true;`);
+
+  /* 6) 回收站：开版本控制 → 删文档 → 列删除标记 → 恢复成副本 */
+  srv.setVersioning(true);
+  const recOn = await cdp.eval(`var L = window.__liji; L.setRecycleEnabled(true); return L.recycleEnabled();`);
+  check('回收站功能可以打开（默认关）', recOn === true, String(recOn));
+  const mkInfo = await cdp.eval(`
+    var L = window.__liji;
+    L.createDocument('空白文档');
+    var d = L.S.documents[0];
+    d.title = '回收站目标文档';
+    L.saveNowAndPush();
+    return { id: d.id, title: d.title };`);
+  const targetKey = 'liji/docs/回收站目标文档.md';
+  await waitDump(keys => keys.indexOf(targetKey) >= 0);
+  const revBeforeDel = await cdp.eval(`return (JSON.parse(localStorage.getItem('liji_oss_state') || '{}').rev) || 0;`);
+  await cdp.eval(`window.__liji.deleteDocument(${mkInfo.id}); return true;`);
+  await cdp.waitFor(`var st = JSON.parse(localStorage.getItem('liji_oss_state') || '{}'); return st.rev >= ${revBeforeDel + 1};`, 15000);
+  await cdp.eval(`window.__liji.recycleOpen(); return true;`);
+  await cdp.waitFor(`return !!window.__liji.S.recycleSheet;`, 15000);
+  const recItems = await cdp.eval(`return (window.__liji.S.recycleItems || []).map(function (x) { return x.key; });`);
+  check('回收站列出被删除的 .md（删除标记）', recItems.indexOf('docs/回收站目标文档.md') >= 0, JSON.stringify(recItems));
+  const nBeforeRec = await cdp.eval(`return window.__liji.S.documents.length;`);
+  await cdp.eval(`
+    var L = window.__liji;
+    var it = null;
+    (L.S.recycleItems || []).forEach(function (x) { if (x.key === 'docs/回收站目标文档.md') it = x; });
+    if (it) L.recycleRestore(it);
+    return !!it;`);
+  const recDone = await cdp.waitFor(`return window.__liji.S.documents.length > ${nBeforeRec};`, 15000);
+  const recDoc = await cdp.eval(`
+    var L = window.__liji;
+    var d = L.S.documents[0];
+    return { title: d.title, tpl: d.template, nodes: (d.nodes || []).length };`);
+  check('恢复成功：内容以副本形式回到文档库并推送', recDone.ok === true
+    && recDoc.title.indexOf('回收站目标文档（恢复') === 0 && recDoc.nodes > 0, JSON.stringify(recDoc));
+  srv.setVersioning(false);
+
   /* ---------- ⑫ 收尾：页面没有报错 ---------- */
   collectErrors();
   const real = pageErrors.filter(e => !/favicon|net::ERR_/.test(e));

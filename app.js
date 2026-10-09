@@ -240,7 +240,7 @@
   /* 本机记住的「云端版本」：{ syncedAt, remoteUpdatedAt, rev, base } —— 启动比对就看这几个数。
      它自己也要落盘：不落盘的话，重启后就不知道上次同步到哪，只能盲目拿云端盖本地。
      rev = 云端 meta 的版本号（乐观锁）；base = 上次同步时每篇文档的内容指纹（三方合并的「共同祖先」）。 */
-  let ossState = { syncedAt: 0, remoteUpdatedAt: 0, device: '', rev: 0, base: null };
+  let ossState = { syncedAt: 0, remoteUpdatedAt: 0, device: '', rev: 0, base: null, mirrorMap: null, mirrorHashes: null };
   let pollTimer = -1;
 
   /* ============================== DOM 工具 ============================== */
@@ -449,6 +449,10 @@
       ossState.device = String(st.device || '');
       ossState.rev = Number(st.rev) || 0;
       ossState.base = (st.base && typeof st.base === 'object') ? st.base : null;
+      /* .md 镜像的「上次推了什么」也要落盘（docId → 桶里 key / 内容指纹），
+         否则刷新后丢基准：改名/删除的旧文件删不掉，内容变没变也判断不出。 */
+      ossState.mirrorMap = (st.mirrorMap && typeof st.mirrorMap === 'object') ? st.mirrorMap : null;
+      ossState.mirrorHashes = (st.mirrorHashes && typeof st.mirrorHashes === 'object') ? st.mirrorHashes : null;
     } catch (e) { }
   }
   function saveOssConfig() {
@@ -614,6 +618,7 @@
       syncFoldersFromDocs();
       S.docTitle = selectedDocument().title;
       saveNow(); render();
+      logOp('恢复本机备份', b.documents.length + ' 篇');
       showNotice('已回到云端覆盖前的本机版本（' + b.documents.length + ' 篇）');
     } catch (e) { showNotice('恢复失败：' + (e.message || e)); }
   }
@@ -687,6 +692,9 @@
     ossState.syncedAt = Date.now();
     ossState.remoteUpdatedAt = meta.updatedAt;
     ossState.device = meta.device;
+    /* .md 源文件镜像 + 操作日志上桶：核心数据已经推成功，这两步**失败不影响正常同步** */
+    await syncMirrorQuiet(OSS);
+    await uploadOpLogQuiet(OSS);
     saveOssState();
     markDocsDirty(false);          // 推成功了才算真的干净；失败要保持脏，下次优先保本机
     S.cloudState = 'synced'; S.lastSyncAt = Date.now();
@@ -695,6 +703,7 @@
       if (merged.fromCloud > 0) parts.push('收下云端 ' + merged.fromCloud + ' 篇');
       if (merged.dup > 0) parts.push(merged.dup + ' 篇两边都改过、各留了一份');
       S.cloudMsg = '检测到其他设备的改动，已自动合并（' + parts.join('，') + '）';
+      logOp('自动合并', S.cloudMsg);
       showNotice(S.cloudMsg);
       if (typeof renderAllowEditing === 'function') renderAllowEditing();
     }
@@ -716,6 +725,8 @@
     ossState.syncedAt = Date.now();
     saveOssState();
     S.cloudState = 'synced'; S.lastSyncAt = Date.now();
+    /* 拉完云端也要对齐镜像：其他设备删掉的文档，本地镜像里的 .md 也要跟着删 */
+    await syncMirrorQuiet(OSS);
     return got.count;
   }
 
@@ -742,9 +753,11 @@
         S.cloudMsg = '已是最新 · 共 ' + S.documents.length + ' 篇';
       }
       S.cloudState = 'synced';
+      logOp('启动同步', S.cloudMsg);
     } catch (e) {
       S.cloudState = 'error';
       S.cloudMsg = e.message || ('同步失败（' + (e.status || '') + '）');
+      logOp('启动同步失败', S.cloudMsg);
     }
     renderAllowEditing();
   }
@@ -794,6 +807,7 @@
     }
     const wasError = S.cloudState === 'error';
     await ossPushQuiet();
+    logOp('手动同步', S.cloudState === 'error' ? '失败：' + (S.cloudMsg || '') : '完成');
     showNotice(S.cloudState === 'error'
       ? ('同步失败：' + (S.cloudMsg || ''))
       : (wasError ? '已恢复同步' : '已同步到对象存储'));
@@ -804,6 +818,7 @@
     S.cloudState = 'syncing'; renderAllowEditing();
     try {
       const n = await ossPull();
+      logOp('用云端覆盖本机', n + ' 篇');
       renderAllowEditing();
       showNotice('已用云端覆盖本机（' + n + ' 篇）—— 覆盖前的本机版本可在下面一键找回');
     } catch (e) {
@@ -816,6 +831,7 @@
     S.cloudState = 'syncing'; renderAllowEditing();
     try {
       await ossPush();
+      logOp('用本机覆盖云端', S.documents.length + ' 篇');
       renderAllowEditing();
       showNotice('已用本机覆盖云端（' + S.documents.length + ' 篇）');
     } catch (e) {
@@ -867,6 +883,208 @@
     saveOssState();
     render();
     showNotice('已断开对象存储，文档仍然存在本机');
+    logOp('断开对象存储', '文档只存在本机');
+  }
+
+  /* ============================== 操作日志（2026-10-09） ==============================
+   * 记录用户的每次具体操作（文件/文件夹级 + 同步事件），方便用户事后检查。
+   * 存两层：① 本机 localStorage 环形缓冲（500 条，超出丢最旧的）；
+   *         ② 每台设备一个 logs/<设备名>.jsonl 上传到桶 —— 按设备分文件就**永远没有
+   *            合并冲突**（谁也不写别人的文件），整文件覆盖写即可。 */
+  const OP_LOG_LS = 'liji_op_log';
+  const OP_LOG_MAX = 500;
+  let opLogCache = null;
+  function opLog() {
+    if (opLogCache) return opLogCache;
+    try { opLogCache = JSON.parse(localStorage.getItem(OP_LOG_LS) || '[]'); } catch (e) { opLogCache = []; }
+    if (!Array.isArray(opLogCache)) opLogCache = [];
+    return opLogCache;
+  }
+  function logOp(event, detail) {
+    try {
+      const arr = opLog();
+      arr.push({ t: Date.now(), e: String(event || ''), d: String(detail || '') });
+      if (arr.length > OP_LOG_MAX) arr.splice(0, arr.length - OP_LOG_MAX);
+      localStorage.setItem(OP_LOG_LS, JSON.stringify(arr));
+    } catch (e) { /* 存储满了也别影响正常操作 */ }
+  }
+
+  /* ============================== .md 源文件镜像（2026-10-09） ==============================
+   * 需求：桶里要有「和前端一样」的文件夹分类 + 可读的 .md 源文件。
+   * 为什么是「镜像」而不是把同步数据源换成 .md：文档里的图片 / 公式 / 加粗颜色是
+   * 结构化数据（data: URL 内嵌在 JSON 里），md 表达不了 —— 拿 .md 当同步源会丢内容。
+   * 所以同步引擎（documents.json + meta.json 乐观锁三方合并）原样保留，
+   * 每次推送**顺带**把每篇文档写成 docs/<文件夹>/<文档名>.md：
+   *   · 未分类的文档直接放 docs/ 根；
+   *   · 名字做对象存储安全清洗（/:*?"<>| 等换成 -），同名文档加 -id 后缀防互覆盖；
+   *   · ossState.mirrorMap 记住「上次每篇推到了哪个 key」→ 改名/移动 = 删旧 key 传新 key，
+   *     删除文档 = 删 key；内容指纹没变的跳过，不做无谓的上传。
+   * 桶里的「文件夹」就是 key 的 / 前缀 —— 控制台会显示成目录。 */
+  const MIRROR_DIR = 'docs/';
+  function sanitizePathSeg(s, fallback) {
+    let t = String(s || '').trim().replace(/\s+/g, ' ');
+    ['/', '\\', ':', '*', '?', '"', '<', '>', '|', '#', '%', '&', '{', '}', '$', '!', "'", ';', '+', '=', '@', '`', '^', '~']
+      .forEach(c => { t = t.split(c).join('-'); });
+    t = t.replace(/[\u0000-\u001f]/g, '').replace(/[. ]+$/g, '');
+    t = t.slice(0, 60).trim();
+    return t || fallback;
+  }
+  function mirrorKeyForDoc(d, usedKeys) {
+    const fid = docFolderId(d);
+    const dir = fid ? (sanitizePathSeg(folderName(fid), '未命名文件夹') + '/') : '';
+    const base = sanitizePathSeg(d.title, '无标题');
+    let key = MIRROR_DIR + dir + base + '.md';
+    if (usedKeys[key] !== undefined && usedKeys[key] !== String(d.id)) {
+      key = MIRROR_DIR + dir + base + '-' + d.id + '.md';     // 同文件夹同名文档：加 id 后缀，别让后写的把先写的盖了
+      if (usedKeys[key] !== undefined && usedKeys[key] !== String(d.id)) {
+        key = MIRROR_DIR + dir + base + '-' + d.id + '-' + Date.now() + '.md';
+      }
+    }
+    usedKeys[key] = String(d.id);
+    return key;
+  }
+  function docToMarkdown(d) {
+    return '# ' + String(d.title || '无标题') + '\n\n' + serializeNodesToMd(d.nodes) + '\n';
+  }
+  async function syncMirror(OSS) {
+    const used = {};
+    const desired = {}, hashes = {};
+    S.documents.forEach(d => {
+      const k = mirrorKeyForDoc(d, used);
+      desired[String(d.id)] = k;
+      hashes[String(d.id)] = docHash(d);
+    });
+    const prevMap = ossState.mirrorMap || {};
+    const prevHashes = ossState.mirrorHashes || {};
+    let ups = 0, dels = 0, errs = 0;
+    for (const id in prevMap) {
+      if (desired[id] !== prevMap[id]) {
+        try { await OSS.del(S.ossCfg, prevMap[id]); dels++; }
+        catch (e) { if (e.status !== 404) errs++; }
+      }
+    }
+    for (const id in desired) {
+      if (prevMap[id] === desired[id] && prevHashes[id] === hashes[id]) continue;
+      const d = S.documents.filter(x => String(x.id) === String(id))[0];
+      if (!d) continue;
+      try { await OSS.put(S.ossCfg, desired[id], docToMarkdown(d)); ups++; }
+      catch (e) { errs++; }
+    }
+    ossState.mirrorMap = desired;
+    ossState.mirrorHashes = hashes;
+    if (ups || dels || errs) saveOssState();
+    return { ups: ups, dels: dels, errs: errs };
+  }
+  /* 推送收尾的镜像 + 日志上传：失败**不影响**正常同步（数据已经上去了），只记日志下次重试 */
+  async function syncMirrorQuiet(OSS) {
+    try {
+      const r = await syncMirror(OSS);
+      if (r && r.errs) logOp('同步', '源文件镜像有 ' + r.errs + ' 个文件没传上，下次同步重试');
+      return r;
+    } catch (e) {
+      logOp('同步', '源文件镜像更新失败：' + (e.message || e));
+      return null;
+    }
+  }
+  async function uploadOpLogQuiet(OSS) {
+    try { await OSS.put(S.ossCfg, opLogUploadKey(), JSON.stringify(opLog())); }
+    catch (e) { /* 日志上传失败不打扰用户，下次同步再传 */ }
+  }
+  function opLogUploadKey() {
+    return 'logs/' + sanitizePathSeg(deviceName(), 'device') + '.jsonl';
+  }
+
+  /* ============================== 回收站（2026-10-09） ==============================
+   * 前提：桶开了「版本控制」—— 开着的时候 DELETE 只是打删除标记，旧版本都在，
+   * 找回 = 把删除标记之前的最后一个版本读出来。
+   * 规矩（按需求）：① 回收站功能默认关，用户在设置里手动打开；
+   *                ② 每次使用前先**行为探测**桶有没有真的开版本控制（管理 API 要管理员
+   *                  权限且 CORS 不放行，探测法只需要普通读写权限）；
+   *                ③ 恢复 = 读旧版本的 .md → 解析成大纲 → 作为**副本**导入文档库（保双份
+   *                  的老口径：谁也不覆盖谁）→ 走正常推送同步。
+   * 注意：镜像的 .md 是纯文本，恢复回来的副本不含图片/公式原数据（镜像里没有的，找不回来）。 */
+  function recycleEnabled() {
+    try { return lsGet('recycleOn', '0') === '1'; } catch (e) { return false; }
+  }
+  function setRecycleEnabled(v) {
+    try { lsSet('recycleOn', v ? '1' : '0'); } catch (e) { }
+    S.recycleOn = !!v;
+  }
+  /* 探测桶的版本控制开关。返回 true / false / null（探测本身失败）。 */
+  async function recycleCheck() {
+    const OSS = ossClient();
+    if (!ossReady() || !OSS || !OSS.probeVersioning) { showNotice('先配置并启用对象存储同步'); return null; }
+    S.recycleMsg = '正在检测桶的版本控制…'; S.recycleBusy = true; render();
+    try {
+      const on = await OSS.probeVersioning(S.ossCfg);
+      S.recycleMsg = on
+        ? '✓ 检测通过：桶已开启版本控制，可以正常使用回收站'
+        : '✗ 检测不到版本控制 —— 请先到对象存储控制台给这个桶开启「版本控制」，再回来点检测';
+      return on;
+    } catch (e) {
+      S.recycleMsg = '检测失败：' + (e.message || e);
+      return null;
+    } finally {
+      S.recycleBusy = false; render();
+    }
+  }
+  /* 打开回收站列表：先检测版本控制，再列举 docs/ 下的删除标记 */
+  async function recycleOpen() {
+    if (!recycleEnabled()) { showNotice('回收站功能还没打开'); return; }
+    if (!ossReady()) { showNotice('先配置并启用对象存储同步'); return; }
+    const on = await recycleCheck();
+    if (!on) { render(); return; }
+    const OSS = ossClient();
+    S.recycleMsg = '正在列出被删除的文件…'; S.recycleBusy = true; render();
+    try {
+      const items = await OSS.listVersions(S.ossCfg, MIRROR_DIR);
+      /* 列举返回的 key 带配置前缀；getVersion 内部会再补一次 —— 先剥成相对 key 存下来 */
+      const pre = (S.ossCfg && S.ossCfg.prefix) || '';
+      const strip = k => (k.indexOf(pre) === 0 ? k.slice(pre.length) : k);
+      const byKey = {};
+      items.forEach(v => { (byKey[v.key] = byKey[v.key] || []).push(v); });
+      const deleted = [];
+      Object.keys(byKey).forEach(key => {
+        const latest = byKey[key].filter(v => v.isLatest)[0];
+        if (!latest || !latest.marker) return;            // 最新态不是删除标记 = 文件还在，不算被删
+        const vers = byKey[key].filter(v => !v.marker).sort((a, b) => b.lastModified - a.lastModified);
+        if (!vers[0]) return;                              // 只有标记没有旧版本（开版本控制之前就删了）→ 找不回
+        deleted.push({ key: strip(key), deletedAt: latest.lastModified, versionId: vers[0].versionId });
+      });
+      deleted.sort((a, b) => b.deletedAt - a.deletedAt);
+      S.recycleItems = deleted;
+      S.recycleSheet = true;
+      logOp('回收站', '查看了回收站（' + deleted.length + ' 个可恢复文件）');
+    } catch (e) {
+      showNotice('读取回收站失败：' + (e.message || e));
+    }
+    S.recycleBusy = false; render();
+  }
+  async function recycleRestore(item) {
+    const OSS = ossClient();
+    if (!OSS || S.recycleBusy) return;
+    S.recycleBusy = true; render();
+    try {
+      const r = await OSS.getVersion(S.ossCfg, item.key, item.versionId);
+      const nodes = parseMarkdownToNodes(r.text);
+      if (!nodes.length) throw new Error('这个 .md 没解析出内容');
+      const base = item.key.split('/').pop().replace(/\.md$/i, '') || '恢复的文档';
+      const id = Date.now();
+      const title = base + '（恢复 ' + hhmmText(Date.now()) + '）';
+      /* 与 md 导入同一口径：展开式建文档对象（别白名单丢字段） */
+      S.documents = [{ id: id, title: title, updatedAt: '刚刚恢复', template: '回收站恢复', nodes: nodes, children: [] }, ...S.documents];
+      S.activeDocId = id; S.docTitle = title; S.editNodeId = nodes[0].id; S.selectedNodeId = nodes[0].id;
+      saveNow();
+      S.recycleSheet = false;
+      logOp('回收站恢复', base + ' → ' + title);
+      try { await ossPush(); } catch (e) { showNotice('文档已恢复到本机，但同步没成功：' + (e.message || e)); }
+      render();
+      showNotice('已恢复「' + base + '」为新文档' + (S.recycleMsg || ''));
+      S.recycleMsg = '';
+    } catch (e) {
+      showNotice('恢复失败：' + (e.message || e));
+    }
+    S.recycleBusy = false; render();
   }
 
   function copyText(text) {
@@ -1927,6 +2145,7 @@
     S.showTemplateSheet = false; S.customTplOpen = false; S.customTplName = ''; S.customTplDesc = '';
     S.showEditor = true;
     scheduleSave(); render();
+    logOp('新建文档', title);
   }
   function deleteDocument(id) {
     const target = S.documents.find(d => d.id === id);
@@ -1939,8 +2158,11 @@
       S.editNodeId = 0; S.selectedNodeId = 0;
     }
     S.confirmDeleteId = 0;
-    scheduleSave();
+    /* ★ 删除是一次性动作，走 saveNowAndPush：只 scheduleSave 的话云端永远不知道这篇没了，
+     *   documents.json 和 .md 镜像都会残留（2026-10-09 加镜像时真浏览器自检抓到）。 */
+    saveNowAndPush();
     render();
+    logOp('删除文档', target.title);
     showNotice('已删除「' + target.title + '」');
   }
   function loadNode(id) { S.editNodeId = id; }
@@ -2028,6 +2250,7 @@
         S.editNodeId = nodes[0].id; S.selectedNodeId = nodes[0].id;
         S.showEditor = true;
         scheduleSave(); render();
+        logOp('导入 Markdown', title + '（' + nodes.length + ' 个主题）');
         showNotice('已导入「' + title + '」：' + nodes.length + ' 个主题（按 Markdown 标题分级）');
       };
       fr.readAsText(f, 'utf-8');
@@ -2310,12 +2533,14 @@
       if (f) f.name = nm;
       S.folderEditId = 0; S.folderInput = '';
       saveNowAndPush(); render(); showNotice('文件夹已重命名为「' + nm + '」');
+      logOp('重命名文件夹', '改为「' + nm + '」');
       return;
     }
     const f = { id: nextFolderId(), name: nm };
     S.folders = S.folders.concat([f]);
     S.showFolderInput = false; S.folderInput = '';
     saveNowAndPush(); render();
+    logOp('新建文件夹', nm);
     showNotice('已创建文件夹「' + nm + '」—— 在文档卡片上点文件夹图标就能移进去');
   }
   /* 删除文件夹**只解散分组**，里面的文档一篇都不删（回到未分类）—— 这一点要在提示里说清楚 */
@@ -2327,6 +2552,7 @@
     S.documents.forEach(d => { if (docFolderId(d) === f.id) delete d.folder; });
     S.confirmFolderId = 0;
     saveNowAndPush(); render();
+    logOp('删除文件夹', f.name + (n > 0 ? '（' + n + ' 篇回到未分类）' : ''));
     showNotice('已删除文件夹「' + f.name + '」' + (n > 0 ? '，里面的 ' + n + ' 篇文档回到「未分类」（文档没删）' : ''));
   }
   function moveDocTo(docId, folderId) {
@@ -2336,6 +2562,7 @@
     if (fid) d.folder = fid; else delete d.folder;
     S.moveDocId = 0; S.newFolderForMove = '';
     saveNowAndPush(); render();
+    logOp('移动文档', String(d.title || '') + ' → ' + (fid ? (folderName(fid) || '未分类') : '未分类'));
     showNotice(fid ? ('已移动到「' + (folderName(fid) || '未分类') + '」') : '已移到「未分类」');
   }
   /* 移动浮层里现建一个文件夹并立刻移进去 —— 「分着分着发现要新建一个」是最常见的路径 */
@@ -2533,6 +2760,8 @@
     scroll.appendChild(info);
     scroll.appendChild(ossCard());
     scroll.appendChild(localCard());
+    scroll.appendChild(recycleCard());
+    scroll.appendChild(opLogCard());
     wrap.appendChild(scroll);
     return wrap;
   }
@@ -2680,6 +2909,111 @@
     card.appendChild(div('muted', { style: { fontSize: '12px', marginTop: '8px', lineHeight: '1.6' } },
       '密钥以明文存在本机：建议单独建一个只授权这个桶的子账号来用。'));
     return card;
+  }
+
+  /* ---------- 回收站卡（2026-10-09） ----------
+   * 前提链路：① 用户在这里打开回收站功能（默认关）→ ② 使用前自动探测桶的版本控制 →
+   * ③ 列出被删的 .md 源文件 → ④ 恢复成新文档。探测失败会给出去控制台开版本的指引。 */
+  function recycleCard() {
+    const card = div('vip-card');
+    const on = recycleEnabled();
+    card.appendChild(div('col', null, [
+      el('h3', null, null, '回收站'),
+      div('p', null, '删除文档时，桶里的 .md 源文件可以找回来恢复成新文档。'
+        + '前提是桶开启了「版本控制」—— 打开此功能后点「检测」确认；没开就去对象存储控制台开启（开启后删除的文件才找得回）。')
+    ]));
+    const row = div('redeem-row');
+    row.appendChild(el('button', 'redeem-btn', {
+      onclick: () => {
+        const next = !on;
+        setRecycleEnabled(next);
+        logOp('回收站', next ? '打开回收站功能' : '关闭回收站功能');
+        if (next && ossReady()) recycleCheck();
+        render();
+      }
+    }, on ? '关闭回收站功能' : '打开回收站功能'));
+    if (on) {
+      row.appendChild(el('button', 'redeem-btn', { onclick: recycleCheck }, S.recycleBusy ? '检测中…' : '检测版本控制'));
+      row.appendChild(el('button', 'redeem-btn', { onclick: recycleOpen }, S.recycleBusy ? '读取中…' : '查看回收站'));
+    }
+    card.appendChild(row);
+    if (S.recycleMsg) card.appendChild(div('redeem-msg', null, S.recycleMsg));
+    return card;
+  }
+  function recycleSheet() {
+    const overlay = div('overlay', {
+      style: { background: 'rgba(18,0,0,.28)', zIndex: '40' },
+      onclick: () => { S.recycleSheet = false; render(); }
+    });
+    const sheet = div('sheet tall', { onclick: ev => ev.stopPropagation() });
+    sheet.appendChild(el('h2', null, null, '回收站'));
+    sheet.appendChild(div('sub', null, '这些 .md 源文件在桶里被删除过。恢复会把内容导入为**新文档**（副本），不影响现有文档。'
+      + '镜像里只有纯文本，恢复的副本不含图片/公式的原始数据。'));
+    const box = div('oplog-list');
+    const items = S.recycleItems || [];
+    if (!items.length) box.appendChild(div('folder-empty', null, '回收站是空的 —— 开启桶的版本控制之后删除的文件才会出现在这里'));
+    items.forEach(it => {
+      const name = it.key.split('/').pop().replace(/\.md$/i, '') || it.key;
+      const row = div('oplog-row');
+      row.appendChild(div(null, null, [
+        div('oplog-ev', null, name),
+        div('oplog-time', null, '删除于 ' + dateText(it.deletedAt) + ' ' + hhmmText(it.deletedAt) + ' · ' + it.key)
+      ]));
+      row.appendChild(el('button', 'redeem-btn', { onclick: () => recycleRestore(it) }, S.recycleBusy ? '…' : '恢复'));
+      box.appendChild(row);
+    });
+    sheet.appendChild(box);
+    overlay.appendChild(sheet);
+    return overlay;
+  }
+
+  /* ---------- 操作日志卡 + 日志浮层（2026-10-09） ---------- */
+  function opLogCard() {
+    const card = div('vip-card');
+    card.appendChild(div('col', null, [
+      el('h3', null, null, '操作日志'),
+      div('p', null, '记录新建/删除文档与文件夹、移动、导入导出、同步与恢复等操作（本机最近 ' + OP_LOG_MAX + ' 条）。'
+        + '同步开启时，每台设备的日志会上传一份到桶里 logs/ 目录，方便多设备之间互相检查。')
+    ]));
+    card.appendChild(div('redeem-row', null, [
+      el('button', 'redeem-btn', { onclick: () => { S.showOpLog = true; render(); } }, '查看日志（' + opLog().length + ' 条）')
+    ]));
+    return card;
+  }
+  function opLogSheet() {
+    const overlay = div('overlay', {
+      style: { background: 'rgba(18,0,0,.28)', zIndex: '40' },
+      onclick: () => { S.showOpLog = false; render(); }
+    });
+    const sheet = div('sheet tall', { onclick: ev => ev.stopPropagation() });
+    sheet.appendChild(el('h2', null, null, '操作日志'));
+    sheet.appendChild(div('sub', null, '最新在前 · 只记录本机这台设备的操作'));
+    const box = div('oplog-list');
+    const arr = opLog().slice().reverse();
+    if (!arr.length) box.appendChild(div('folder-empty', null, '还没有操作记录'));
+    arr.forEach(x => {
+      const row = div('oplog-row');
+      row.appendChild(div(null, null, [
+        div('oplog-ev', null, x.e + (x.d ? ' · ' + x.d : '')),
+        div('oplog-time', null, dateText(x.t) + ' ' + hhmmText(x.t))
+      ]));
+      box.appendChild(row);
+    });
+    sheet.appendChild(box);
+    sheet.appendChild(div('redeem-row', null, [
+      el('button', 'redeem-btn', {
+        onclick: () => {
+          try { localStorage.removeItem(OP_LOG_LS); } catch (e) { }
+          opLogCache = null;
+          logOp('清空日志', '用户手动清空');
+          render();
+          showNotice('操作日志已清空');
+        }
+      }, '清空日志'),
+      el('button', 'redeem-btn', { onclick: () => { S.showOpLog = false; render(); } }, '关闭')
+    ]));
+    overlay.appendChild(sheet);
+    return overlay;
   }
 
   /* ============================== 视图：侧边导航（桌面） ============================== */
@@ -4359,9 +4693,11 @@
       screen.appendChild(main);
     }
     appEl.appendChild(screen);
-    if (S.showTemplateSheet) appEl.appendChild(TemplateSheet());
-    /* 导出 PDF 超页的确认弹窗盖在模板浮层之上 —— 它问的是「这一步要不要继续」，不能被挡住 */
+    if (S.showTemplateSheet) appEl.appendChild(TemplateSheet());    /* 导出 PDF 超页的确认弹窗盖在模板浮层之上 —— 它问的是「这一步要不要继续」，不能被挡住 */
     if (S.exportConfirm) appEl.appendChild(PdfOverflowDialog());
+    /* 操作日志 / 回收站浮层：普通底部面板，排在业务浮层之后、查看器之前 */
+    if (S.showOpLog) appEl.appendChild(opLogSheet());
+    if (S.recycleSheet) appEl.appendChild(recycleSheet());
     /* 图片/公式查看器与公式编辑器排在最后 —— 它们要盖住上面所有浮层 */
     if (S.mediaView) appEl.appendChild(MediaViewer());
     if (S.showFormula) appEl.appendChild(FormulaSheet());
@@ -4682,10 +5018,12 @@
           return;                       // 等用户在弹窗里选「继续」或「取消」
         }
         download(buildPdf(imgs), pdfName(kind));
+        logOp('导出', pdfName(kind) + '（PDF，' + imgs.length + ' 页）');
         showNotice('已导出：' + pdfName(kind));
       } else if (kind === 'doc-md') {
         const name = fileName('.md');
         download(new Blob([serializeNodesToMd(selectedDocument().nodes)], { type: 'text/markdown;charset=utf-8' }), name);
+        logOp('导出', name + '（Markdown）');
         showNotice('已导出：' + name);
       } else {
         download(new Blob([canvasPng(renderMapCanvas(2))], { type: 'image/png' }), fileName('-导图.png'));
@@ -4732,6 +5070,7 @@
     /* Markdown 导入 / 导出（2026-10-07）+ 首主题一级 / 删除归并（2026-10-08） */
     parseMarkdownToNodes, serializeNodesToMd, importMarkdownFile,
     normalizeFirstLevel, deleteRow, deletedRowNotice,
+    deleteDocument, createFolderAndMove,
     /* 行内样式 runs（2026-09-23）：主题内的文字可选中单独设置样式 */
     nodeRuns, effStyle, applyRunPatch, shiftRuns, spansForRange,
     /* 富文本编辑框（contenteditable）的选区读写与「后续输入样式」：自检要能直接戳 */
@@ -4742,6 +5081,9 @@
     ossSaveConfig, ossClearConfig, ossTestConnection, loadOssConfig, saveOssConfig,
     restoreLocalBackup, applyRemote, syncPayload, ossReady,
     mergeLibrary, docHashes, docHash,
+    /* 操作日志 / .md 镜像 / 回收站（2026-10-09）：自检要能直接戳 */
+    logOp, opLog, opLogUploadKey, syncMirror, mirrorKeyForDoc, docToMarkdown, sanitizePathSeg,
+    recycleEnabled, setRecycleEnabled, recycleCheck, recycleOpen, recycleRestore,
     /* 公式与图片 / 导图编辑（2026-09-22） */
     nodeMedia, addNodeMedia, removeNodeMedia, patchNodeMedia, findMediaAcrossDoc,
     openMediaView, closeMediaView, applyMediaEdit, setMediaAspect,

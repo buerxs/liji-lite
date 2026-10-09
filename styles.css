@@ -502,6 +502,14 @@ input,textarea{font-family:inherit;}
 
 /* 公告详情：正文可滚动，图片自适应宽度 */
 .sheet.tall{max-height:88%;overflow-y:auto;overscroll-behavior:contain;}
+
+/* 操作日志 / 回收站列表（2026-10-09）：行内两行——事件在上、时间在下 */
+.oplog-list{margin-top:6px;padding:0 2px;}
+.oplog-row{display:flex;align-items:center;justify-content:space-between;gap:10px;
+  padding:9px 2px;border-bottom:1px solid var(--line);}
+.oplog-row:last-child{border-bottom:none;}
+.oplog-ev{font-size:14px;color:#2C3835;line-height:1.5;word-break:break-word;}
+.oplog-time{font-size:12px;color:var(--muted);margin-top:2px;word-break:break-all;}
 .notice-meta{display:flex;align-items:center;gap:7px;margin:2px 0 14px;width:100%;}
 .notice-body{font-size:15px;line-height:1.85;color:#2C3835;word-break:break-word;}
 .notice-body .ann-img{

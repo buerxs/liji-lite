@@ -324,7 +324,11 @@
     if (c.sessionToken) h['x-oss-security-token'] = c.sessionToken;
     const ossHeaders = Object.keys(h).filter(k => k.indexOf('x-oss-') === 0)
       .sort().map(k => k + ':' + h[k] + '\n').join('');
-    const resource = '/' + c.bucket + cpath;
+    /* ★ CanonicalizedResource 必须带上子资源查询参数（按 key 排序、值不编码）：
+     *   ?versions / ?versionId / ?acl 这类请求不把参数签进去就是 403（2026-10-09 回收站功能踩到）。 */
+    let resource = '/' + c.bucket + cpath;
+    const subKeys = Object.keys(query || {}).filter(k => query[k] !== undefined && query[k] !== null).sort();
+    if (subKeys.length) resource += '?' + subKeys.map(k => k + (query[k] === '' ? '' : '=' + String(query[k]))).join('&');
     const strToSign = [method, '', h['content-type'] || '', date, ossHeaders].join('\n') + resource;
     const sig = await hmacB64('SHA-1', c.sk, strToSign);
     const out = Object.assign({}, h);
@@ -377,7 +381,16 @@
     if (h['content-type'] !== undefined) signed['content-type'] = h['content-type'];
     const signKeys = Object.keys(signed).sort();
     const httpHeaders = signKeys.map(k => k + '=' + rfc3986(signed[k])).join('&');
-    const httpString = [method.toLowerCase(), cpath, canonicalQuery(query), httpHeaders, ''].join('\n');
+    /* ★ COS 官方 SDK 签名时把 URL 参数名统一小写（versionId→versionid），HttpString
+     *   的参数行与 q-url-param-list 都用小写 key —— 大小写不一致就是 403。
+     *   URL 里发送的参数名保持原样（服务端收得到），只在签名口径上小写。 */
+    const cosParams = {};
+    Object.keys(query || {}).forEach(k => { cosParams[String(k).toLowerCase()] = query[k]; });
+    const paramKeys = Object.keys(cosParams).sort();
+    const paramLine = paramKeys
+      .map(k => rfc3986(k) + '=' + rfc3986(cosParams[k] === undefined || cosParams[k] === null ? '' : cosParams[k]))
+      .join('&');
+    const httpString = [method.toLowerCase(), cpath, paramLine, httpHeaders, ''].join('\n');
     const stringToSign = ['sha1', keyTime, await digestHex('SHA-1', httpString), ''].join('\n');
     const signKey = await hmacHex('SHA-1', c.sk, keyTime);
     /* ★ COS 与 S3 V4 的关键差异：第二次 HMAC 的密钥是 SignKey 的**十六进制字符串本身**
@@ -386,7 +399,7 @@
     const sig = await hmacHex('SHA-1', utf8(signKey), stringToSign);
     const out = Object.assign({}, h);
     out['authorization'] = ['q-sign-algorithm=sha1', 'q-ak=' + c.ak, 'q-sign-time=' + keyTime,
-      'q-key-time=' + keyTime, 'q-header-list=' + signKeys.join(';'), 'q-url-param-list=',
+      'q-key-time=' + keyTime, 'q-header-list=' + signKeys.join(';'), 'q-url-param-list=' + paramKeys.join(';'),
       'q-signature=' + sig].join('&');
     return out;
   }
@@ -517,6 +530,76 @@
     }
   }
 
+  /* ============================== 版本控制 / 回收站（2026-10-09） ==============================
+   * 三家（S3 / 阿里 / 腾讯）的版本列举都是 GET /?versions，返回 S3 兼容的
+   * <Version> / <DeleteMarker> 条目；读指定版本 GET ?versionId=…；删指定版本 DELETE ?versionId=…。
+   * 「版本控制开着没」没法用管理 API 问（要管理员权限、CORS 也不放行），改用行为探测：
+   *   写一个探针对象 → 删掉 → 列举它的版本 —— 开着能看到 Version + DeleteMarker，没开就是空。 */
+  function xmlDecode(s) {
+    return String(s || '')
+      .replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"')
+      .replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+  }
+  function parseVersions(xml) {
+    const out = [];
+    const grab = (tag, isMarker) => {
+      const re = new RegExp('<' + tag + '>([\\s\\S]*?)</' + tag + '>', 'g');
+      let m;
+      while ((m = re.exec(xml)) !== null) {
+        const b = m[1];
+        const k = /<Key>([\s\S]*?)<\/Key>/.exec(b);
+        const vid = /<VersionId>([\s\S]*?)<\/VersionId>/.exec(b);
+        const lm = /<LastModified>([\s\S]*?)<\/LastModified>/.exec(b);
+        out.push({
+          key: xmlDecode(k ? k[1] : ''),
+          versionId: xmlDecode(vid ? vid[1] : ''),
+          isLatest: /<IsLatest>\s*true\s*<\/IsLatest>/i.test(b),
+          lastModified: Date.parse(xmlDecode(lm ? lm[1] : '')) || 0,
+          marker: isMarker
+        });
+      }
+    };
+    grab('Version', false);
+    grab('DeleteMarker', true);
+    return out;
+  }
+  async function listVersions(c, prefix) {
+    /* ★ prefix 过滤参数要发**带配置前缀的全名**（桶里的 key 都是 liji/docs/... 这种），
+       调用方传的是相对前缀（如 docs/）；返回的 Key 保留桶里的全名，由调用方剥前缀。 */
+    const cfg = normalize(c);
+    const full = fullKey(cfg, prefix || '');
+    const r = await request(c, 'GET', '', null, { 'versions': '', 'max-keys': '1000', 'prefix': full });
+    return parseVersions(r.text);
+  }
+  async function getVersion(c, key, versionId) {
+    const r = await request(c, 'GET', key, null, { 'versionId': versionId });
+    return { ok: true, text: r.text, status: r.status };
+  }
+  async function delVersion(c, key, versionId) {
+    await request(c, 'DELETE', key, null, { 'versionId': versionId });
+    return { ok: true };
+  }
+  /* 行为探测（见上）：探针留在固定前缀下，有 1 字节残留也无妨（应用自身不用这个前缀）。
+   * ★ 列举返回的 Key 带**配置前缀**（如 liji/__liji_probe__/...），而 put/get/del/delVersion
+   *   收的是相对 key（内部再补前缀）—— 对比与二次删除前必须先剥掉，否则探针永远判「没开」。 */
+  async function probeVersioning(c) {
+    const cfg = normalize(c);
+    const pre = cfg.prefix || '';
+    const strip = k => (k.indexOf(pre) === 0 ? k.slice(pre.length) : k);
+    const probe = '__liji_probe__/version.txt';
+    await put(c, probe, 'probe');
+    try { await del(c, probe); } catch (e) { }
+    const list = await listVersions(c, '__liji_probe__/');
+    const seen = list.filter(v => strip(v.key) === probe);
+    for (let i = 0; i < seen.length; i++) {
+      try { await delVersion(c, strip(seen[i].key), seen[i].versionId); } catch (e) { }
+    }
+    if (seen.some(v => v.marker)) {
+      try { await del(c, probe); } catch (e) { }
+    }
+    return seen.length > 0;
+  }
+
   window.LiJiOSS = {
     PROVIDERS: PROVIDERS,
     normalize: normalize,
@@ -529,6 +612,11 @@
     put: put,
     del: del,
     test: test,
+    listVersions: listVersions,
+    getVersion: getVersion,
+    delVersion: delVersion,
+    probeVersioning: probeVersioning,
+    parseVersions: parseVersions,
     cryptoOk: hasSubtle,
     /* 自检要用：把摘要与签名底子暴露出来做离线比对（不联网也能验算法对不对） */
     _sign: {

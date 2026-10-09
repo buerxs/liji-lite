@@ -31,6 +31,17 @@ function verifyCos(req) {
   auth.split('&').forEach(p => { const i = p.indexOf('='); if (i > 0) parts[p.slice(0, i)] = p.slice(i + 1); });
   if (parts['q-sign-algorithm'] !== 'sha1') return { ok: false, code: 'AccessDenied', msg: '不是 COS 签名格式' };
   if (parts['q-ak'] !== COS_ACCESS_KEY) return { ok: false, code: 'InvalidAccessKeyId', msg: 'AccessKey 不存在' };
+  const url = new URL(req.url, 'http://localhost');
+  /* ★ q-url-param-list 验证（2026-10-09 回收站功能补的）：官方 SDK 把参数名**统一小写**后参与
+   *   签名，HttpString 的参数行也用小写 key。声称列表、参数行、实际 query 三方必须一致。 */
+  const params = {};
+  Array.from(url.searchParams.keys()).forEach(k => { params[k.toLowerCase()] = url.searchParams.get(k) || ''; });
+  const paramKeys = Object.keys(params).sort();
+  const claimedParams = (parts['q-url-param-list'] || '').split(';').filter(Boolean);
+  if (claimedParams.join(';') !== paramKeys.join(';')) {
+    return { ok: false, code: 'SignatureNotMatch', msg: 'q-url-param-list 与实际 query 不一致（声称 [' + claimedParams.join(';') + ']，实际 [' + paramKeys.join(';') + ']）' };
+  }
+  const paramLine = paramKeys.map(k => rfc3986(k) + '=' + rfc3986(params[k])).join('&');
   const hdrs = { host: req.headers['host'] };
   if (req.headers['content-type'] !== undefined) hdrs['content-type'] = req.headers['content-type'];
   /* COS 规定 x-cos-* 头必须全部参与签名（如 x-cos-acl）——漏签在真桶就是 403 */
@@ -42,8 +53,7 @@ function verifyCos(req) {
   if (claimed.join(';') !== keys.join(';')) {
     return { ok: false, code: 'SignatureNotMatch', msg: 'q-header-list 与实际头不一致（声称 [' + claimed.join(';') + ']，实际 [' + keys.join(';') + ']）' };
   }
-  const url = new URL(req.url, 'http://localhost');
-  const httpString = [req.method.toLowerCase(), url.pathname, '', keys.map(k => k + '=' + rfc3986(hdrs[k])).join('&'), ''].join('\n');
+  const httpString = [req.method.toLowerCase(), url.pathname, paramLine, keys.map(k => k + '=' + rfc3986(hdrs[k])).join('&'), ''].join('\n');
   const keyTime = parts['q-sign-time'] || '';
   const stringToSign = ['sha1', keyTime, crypto.createHash('sha1').update(httpString).digest('hex'), ''].join('\n');
   const signKey = crypto.createHmac('sha1', COS_SECRET_KEY).update(keyTime).digest('hex');
@@ -119,7 +129,34 @@ const CORS = {
 };
 
 async function start(port) {
-  const store = new Map();     // key -> { body:Buffer, contentType }
+  /* key -> 版本数组（时间序）。每条 {vid, body, contentType, marker, lm}：
+   * versioning 关着时 PUT 覆盖单条、DELETE 清空；开着时 PUT 追加、DELETE 追加删除标记，
+   * 与真实桶的行为一致 —— 回收站的「列删除标记 / 读旧版本 / 删指定版本」就在这条链路上验。 */
+  const store = new Map();
+  const state = { versioning: false };
+  let vidSeq = 0;
+  /* ★ S3 语义：对象是否「活着」只看**最后一条**——是删除标记就是删除态，
+     不存在「跳过标记拿旧版本」这种读法（旧版本只能靠 versionId 读）。 */
+  const LIVE = arr => { const l = arr[arr.length - 1]; return (l && !l.marker) ? l : null; };
+
+  function versionsXml(prefix) {
+    const rows = [];
+    const keys = Array.from(store.keys()).sort().filter(k => k.indexOf(prefix) === 0);
+    keys.forEach(k => {
+      const arr = store.get(k) || [];
+      /* 桶存的 key 是 URL 编码形态（pathname 原样），列举里还原成 UTF-8（与真桶一致） */
+      let raw = k;
+      try { raw = decodeURIComponent(k); } catch (e) { }
+      arr.forEach((v, i) => {
+        const tag = v.marker ? 'DeleteMarker' : 'Version';
+        rows.push('<' + tag + '><Key>' + raw.replace(/[<>&]/g, c => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;' }[c])) + '</Key><VersionId>' + v.vid + '</VersionId>'
+          + '<IsLatest>' + (i === arr.length - 1 ? 'true' : 'false') + '</IsLatest>'
+          + '<LastModified>' + new Date(v.lm).toISOString() + '</LastModified></' + tag + '>');
+      });
+    });
+    return '<?xml version="1.0" encoding="UTF-8"?><ListVersionsResult>' + rows.join('') + '</ListVersionsResult>';
+  }
+
   const srv = http.createServer((req, res) => {
     const chunks = [];
     req.on('data', c => chunks.push(c));
@@ -136,25 +173,58 @@ async function start(port) {
       const url = new URL(req.url, 'http://localhost');
       /* 路径风格：/bucket/key...（第一层是 bucket 名） */
       const key = url.pathname.replace(/^\/+/, '').replace(/^[^/]+\//, '');
+      const vid = url.searchParams.get('versionId');
+      const wantVersions = url.searchParams.has('versions');
+
+      /* 桶级列举（GET /?versions&prefix=…）—— 回收站的列表与版本探测走这里。
+       * 带配置前缀时路径是 /bucket/liji/，key 非空，所以判据用「有没有 versions 参数」。 */
+      if (req.method === 'GET' && wantVersions) {
+        const prefix = url.searchParams.get('prefix') || '';
+        res.writeHead(200, Object.assign({ 'Content-Type': 'application/xml' }, CORS));
+        return res.end(versionsXml(prefix));
+      }
       if (req.method === 'PUT') {
-        store.set(key, { body: bodyBuf, contentType: req.headers['content-type'] || '' });
+        const entry = { vid: ++vidSeq, body: Buffer.from(bodyBuf), contentType: req.headers['content-type'] || '', marker: false, lm: Date.now() };
+        if (!store.has(key)) store.set(key, []);
+        const arr = store.get(key);
+        if (state.versioning) arr.push(entry);
+        else store.set(key, [entry]);
         res.writeHead(200, Object.assign({ ETag: '"' + sha256hex(bodyBuf) + '"' }, CORS));
         return res.end('');
       }
       if (req.method === 'GET') {
-        const it = store.get(key);
-        if (!it) { res.writeHead(404, Object.assign({ 'Content-Type': 'application/xml' }, CORS)); return res.end(xmlError('NoSuchKey', 'no such key ' + key)); }
-        res.writeHead(200, Object.assign({ ETag: '"' + sha256hex(it.body) + '"', 'Content-Type': it.contentType || 'application/octet-stream' }, CORS));
-        return res.end(it.body);
+        const arr = store.get(key);
+        if (vid) {
+          const hit = (arr || []).filter(x => String(x.vid) === vid)[0];
+          if (!hit || hit.marker) { res.writeHead(404, Object.assign({ 'Content-Type': 'application/xml' }, CORS)); return res.end(xmlError('NoSuchVersion', 'no such version ' + vid)); }
+          res.writeHead(200, Object.assign({ ETag: '"' + sha256hex(hit.body) + '"', 'Content-Type': hit.contentType || 'application/octet-stream' }, CORS));
+          return res.end(hit.body);
+        }
+        const live = arr ? LIVE(arr) : null;
+        if (!live) { res.writeHead(404, Object.assign({ 'Content-Type': 'application/xml' }, CORS)); return res.end(xmlError('NoSuchKey', 'no such key ' + key)); }
+        res.writeHead(200, Object.assign({ ETag: '"' + sha256hex(live.body) + '"', 'Content-Type': live.contentType || 'application/octet-stream' }, CORS));
+        return res.end(live.body);
       }
       if (req.method === 'HEAD') {
-        const it = store.get(key);
-        if (!it) { res.writeHead(404, CORS); return res.end(''); }
-        res.writeHead(200, Object.assign({ ETag: '"' + sha256hex(it.body) + '"' }, CORS));
+        const arr = store.get(key);
+        const live = arr ? LIVE(arr) : null;
+        if (!live) { res.writeHead(404, CORS); return res.end(''); }
+        res.writeHead(200, Object.assign({ ETag: '"' + sha256hex(live.body) + '"' }, CORS));
         return res.end('');
       }
       if (req.method === 'DELETE') {
-        store.delete(key);
+        const arr = store.get(key);
+        if (vid) {
+          /* 删指定版本：从历史里摘掉那一行（删掉删除标记 = 对象复活） */
+          if (arr) store.set(key, arr.filter(x => String(x.vid) !== vid));
+          res.writeHead(204, CORS); return res.end('');
+        }
+        if (state.versioning) {
+          if (!arr) { res.writeHead(204, CORS); return res.end(''); }
+          arr.push({ vid: ++vidSeq, body: Buffer.alloc(0), contentType: '', marker: true, lm: Date.now() });
+        } else {
+          store.delete(key);
+        }
         res.writeHead(204, CORS); return res.end('');
       }
       res.writeHead(405, CORS); res.end('');
@@ -170,6 +240,8 @@ async function start(port) {
     url: 'http://127.0.0.1:' + srv.address().port,
     size: () => store.size,
     dump: () => Array.from(store.keys()),
+    setVersioning: v => { state.versioning = !!v; },
+    versioning: () => state.versioning,
     close: () => new Promise(r => srv.close(r))
   };
 }
