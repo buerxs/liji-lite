@@ -176,9 +176,10 @@ async function start(port) {
       const vid = url.searchParams.get('versionId');
       const wantVersions = url.searchParams.has('versions');
 
-      /* 桶级列举（GET /?versions&prefix=…）—— 回收站的列表与版本探测走这里。
-       * 带配置前缀时路径是 /bucket/liji/，key 非空，所以判据用「有没有 versions 参数」。 */
-      if (req.method === 'GET' && wantVersions) {
+      /* 桶级列举（GET /bucket/?versions&prefix=…）—— 回收站的列表与版本探测走这里。
+       * ★ 与真桶同口径：versions 列举只在 key 路径为空时成立（prefix 走 query），
+       *   把前缀拼进路径的写法在这里直接 404，跟真桶一样不宽容。 */
+      if (req.method === 'GET' && wantVersions && !key) {
         const prefix = url.searchParams.get('prefix') || '';
         res.writeHead(200, Object.assign({ 'Content-Type': 'application/xml' }, CORS));
         return res.end(versionsXml(prefix));

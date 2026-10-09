@@ -324,10 +324,18 @@
     if (c.sessionToken) h['x-oss-security-token'] = c.sessionToken;
     const ossHeaders = Object.keys(h).filter(k => k.indexOf('x-oss-') === 0)
       .sort().map(k => k + ':' + h[k] + '\n').join('');
-    /* ★ CanonicalizedResource 必须带上子资源查询参数（按 key 排序、值不编码）：
-     *   ?versions / ?versionId / ?acl 这类请求不把参数签进去就是 403（2026-10-09 回收站功能踩到）。 */
+    /* ★ CanonicalizedResource 只签**白名单子资源**（versions / versionId / acl / response-* 等），
+     *   按 key 排序、有值带值无值只写 key —— prefix / max-keys 这类普通 query 参数**不进**签名。
+     *   （2026-10-09 真桶验证抓到：第一版把全部 query 都拼进去，?versions 一上就 SignatureDoesNotMatch。
+     *   注意这与 S3 SigV4 / 阿里 V4 的「全量 query 参与签名」口径相反，别互相照抄。） */
     let resource = '/' + c.bucket + cpath;
-    const subKeys = Object.keys(query || {}).filter(k => query[k] !== undefined && query[k] !== null).sort();
+    const SUBRES = {};
+    ['acl', 'uploads', 'location', 'cors', 'logging', 'website', 'referer', 'lifecycle', 'delete',
+      'append', 'tagging', 'objectMeta', 'uploadId', 'partNumber', 'security-token', 'position',
+      'img', 'style', 'styleName', 'replication', 'replicationProgress', 'replicationLocation',
+      'cname', 'bucketInfo', 'comp', 'requestPayment', 'x-oss-traffic-limit', 'versions', 'versionId'
+    ].forEach(k => { SUBRES[k] = true; });
+    const subKeys = Object.keys(query || {}).filter(k => SUBRES[k] === true || k.indexOf('response-') === 0).sort();
     if (subKeys.length) resource += '?' + subKeys.map(k => k + (query[k] === '' ? '' : '=' + String(query[k]))).join('&');
     const strToSign = [method, '', h['content-type'] || '', date, ossHeaders].join('\n') + resource;
     const sig = await hmacB64('SHA-1', c.sk, strToSign);
@@ -564,11 +572,14 @@
     return out;
   }
   async function listVersions(c, prefix) {
-    /* ★ prefix 过滤参数要发**带配置前缀的全名**（桶里的 key 都是 liji/docs/... 这种），
-       调用方传的是相对前缀（如 docs/）；返回的 Key 保留桶里的全名，由调用方剥前缀。 */
+    /* ★ 列举是**桶级**请求：路径必须是 /bucket/?versions（key 路径为空），prefix 只作为
+     *   query 参数 —— 把前缀拼进路径的话真桶会当成「列举某个 object」报 NoSuchKey
+     *   （2026-10-09 真桶验证抓到；mock 对 versions 分支不看 key，验不出这个差别）。
+     *   prefix 参数值仍要带配置前缀（桶里的 key 全名以它开头）。 */
     const cfg = normalize(c);
+    const c2 = Object.assign({}, cfg, { prefix: '' });
     const full = fullKey(cfg, prefix || '');
-    const r = await request(c, 'GET', '', null, { 'versions': '', 'max-keys': '1000', 'prefix': full });
+    const r = await request(c2, 'GET', '', null, { 'versions': '', 'max-keys': '1000', 'prefix': full });
     return parseVersions(r.text);
   }
   async function getVersion(c, key, versionId) {

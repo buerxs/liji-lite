@@ -208,14 +208,14 @@ function check(name, cond, extra) {
   const cosNonMarker = cosA.filter(x => !x.marker).sort((a, b) => b.lastModified - a.lastModified)[0];
   const cosVer = await OSS.getVersion(cosSrvCfg, 'docs/a.md', cosNonMarker.versionId);
   check('COS 按 versionId 读回内容', cosVer.text === '# cos', cosVer.text);
-  /* 对照实验：打断 signOssV1 的子资源拼接，同一请求的签名必须**改变**——
-   * 证明 query 真的参与了 V1 签名（符合阿里规范的最终判据是真桶 403 回显对拍，见 test-oss.js 基线）。
-   * ★ 注：mock 只实现了 SigV4 与 COS 验签，阿里 V1 的「签得过」只能靠真桶，所以这里用离线对照。 */
+  /* 对照实验：把 signOssV1 的白名单子资源过滤打断成「全量 query 拼接」（旧 bug 形态），
+   * 同一请求的签名必须**改变**——证明 V1 只签白名单、多签普通参数就是签名错误。
+   * （符合阿里规范的最终判据是真桶验证：2026-10-09 真桶 ?versions 全链路通过。） */
   {
     const src = fs.readFileSync(path.join(__dirname, '..', 'oss.js'), 'utf8');
-    const anchor = "const subKeys = Object.keys(query || {}).filter(k => query[k] !== undefined && query[k] !== null).sort();";
+    const anchor = "const subKeys = Object.keys(query || {}).filter(k => SUBRES[k] === true || k.indexOf('response-') === 0).sort();";
     check('对照实验锚点唯一', src.split(anchor).length === 2);
-    const broken = src.replace(anchor, 'const subKeys = [];');
+    const broken = src.replace(anchor, 'const subKeys = Object.keys(query || {}).sort();');
     const mk = code => {
       const w = {};
       new Function('window', 'crypto', 'btoa', 'atob', 'TextEncoder', 'URL', 'fetch', code)(
