@@ -53,7 +53,10 @@ function verifyCos(req) {
   if (claimed.join(';') !== keys.join(';')) {
     return { ok: false, code: 'SignatureNotMatch', msg: 'q-header-list 与实际头不一致（声称 [' + claimed.join(';') + ']，实际 [' + keys.join(';') + ']）' };
   }
-  const httpString = [req.method.toLowerCase(), url.pathname, paramLine, keys.map(k => k + '=' + rfc3986(hdrs[k])).join('&'), ''].join('\n');
+  /* ★ HttpString 的 pathname 用**解码后的原始路径**（2026-10-09 对齐官方 SDK 源码：
+   *   cos-js-sdk-v5 util.getAuth 的 formatString 第二段直接放 raw pathname，
+   *   中文/空格不编码 —— 编码路径签 ASCII 碰巧相等，中文 key 必 403）。 */
+  const httpString = [req.method.toLowerCase(), decodeURIComponent(url.pathname), paramLine, keys.map(k => k + '=' + rfc3986(hdrs[k])).join('&'), ''].join('\n');
   const keyTime = parts['q-sign-time'] || '';
   const stringToSign = ['sha1', keyTime, crypto.createHash('sha1').update(httpString).digest('hex'), ''].join('\n');
   const signKey = crypto.createHmac('sha1', COS_SECRET_KEY).update(keyTime).digest('hex');

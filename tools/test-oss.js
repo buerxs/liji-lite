@@ -125,6 +125,36 @@ function check(name, got, want) {
     check('COS signCos 全链路（冻结时间复算）', m ? m[1] : '(无 q-signature)', expectSig);
   }
 
+  /* COS 中文 key：HttpString 的 pathname 用**原始（未编码）路径**——
+   * cos-js-sdk-v5 util.getAuth 的 formatString 第二段直接放 raw pathname（2026-10-09 对齐源码；
+   * 用户腾讯桶实测：编码路径签，ASCII 的 documents.json 能过、中文镜像 .md 必 403）。 */
+  let cjkAuth = '';
+  try {
+    globalThis.Date = class extends RealDate { static now() { return fixedMs; } };
+    const cjkPath = '/liji/docs/' + encodeURIComponent('粉笔') + '/' + encodeURIComponent('团圆-三九胃泰') + '.md';
+    const out = await OSS._sign.signCos(cosCfg, 'put',
+      'https://b-1250000000.cos.ap-guangzhou.myqcloud.com' + cjkPath, cjkPath,
+      {}, { 'content-type': 'application/json; charset=utf-8' }, '');
+    cjkAuth = out.authorization;
+  } finally { globalThis.Date = RealDate; }
+  {
+    const sec = Math.floor(fixedMs / 1000);
+    const keyTime = (sec - 60) + ';' + (sec + 3600);
+    const httpHeaders = 'content-type=application%2Fjson%3B%20charset%3Dutf-8&host=b-1250000000.cos.ap-guangzhou.myqcloud.com';
+    const cjkStsRaw = 'put\n/liji/docs/粉笔/团圆-三九胃泰.md\n\n' + httpHeaders + '\n';
+    const signKey = nodeCrypto.createHmac('sha1', 'secret/plus').update(keyTime).digest('hex');
+    const stsRaw = 'sha1\n' + keyTime + '\n' + nodeCrypto.createHash('sha1').update(cjkStsRaw).digest('hex') + '\n';
+    const expectRaw = nodeCrypto.createHmac('sha1', Buffer.from(signKey, 'utf8')).update(stsRaw).digest('hex');
+    const mc = /q-signature=([0-9a-f]{40})/.exec(cjkAuth);
+    check('COS 中文 key（HttpString 用原始路径）', mc ? mc[1] : '(无 q-signature)', expectRaw);
+    /* 对照：按编码路径签的旧写法签名必须不同 */
+    const cjkStsEnc = 'put\n' + '/liji/docs/' + encodeURIComponent('粉笔') + '/' + encodeURIComponent('团圆-三九胃泰') + '.md' + '\n\n' + httpHeaders + '\n';
+    const stsEnc = 'sha1\n' + keyTime + '\n' + nodeCrypto.createHash('sha1').update(cjkStsEnc).digest('hex') + '\n';
+    const expectEnc = nodeCrypto.createHmac('sha1', Buffer.from(signKey, 'utf8')).update(stsEnc).digest('hex');
+    check('对照：COS 按编码路径签中文 key 的旧写法签名必须不同',
+      String((mc ? mc[1] : '') !== expectEnc), 'true');
+  }
+
   /* COS 签名的真桶行为由 test-oss-e2e.js 的 mock 服务端按「实际收到的头」重算 q-signature 对比。 */
 
   /* ---- 阿里云 OSS 签名 ----

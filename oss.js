@@ -403,7 +403,11 @@
     const paramLine = paramKeys
       .map(k => rfc3986(k) + '=' + rfc3986(cosParams[k] === undefined || cosParams[k] === null ? '' : cosParams[k]))
       .join('&');
-    const httpString = [method.toLowerCase(), cpath, paramLine, httpHeaders, ''].join('\n');
+    /* ★ HttpString 里的 pathname 用**原始（未编码）路径**：官方 SDK（cos-js-sdk-v5 util.getAuth）
+     *   的 formatString 第二段直接放 raw pathname，中文/空格不编码——
+     *   之前签编码路径，ASCII 碰巧相等（documents.json 能传），中文镜像 .md 必 403
+     *   （2026-10-09 用户腾讯桶实测，与阿里 V1 同方向、与 S3/阿里V4 相反）。 */
+    const httpString = [method.toLowerCase(), decodeURIComponent(cpath), paramLine, httpHeaders, ''].join('\n');
     const stringToSign = ['sha1', keyTime, await digestHex('SHA-1', httpString), ''].join('\n');
     const signKey = await hmacHex('SHA-1', c.sk, keyTime);
     /* ★ COS 与 S3 V4 的关键差异：第二次 HMAC 的密钥是 SignKey 的**十六进制字符串本身**
