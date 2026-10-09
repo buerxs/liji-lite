@@ -26,7 +26,7 @@
     return 'http://127.0.0.1:5173';
   })();
   const SERVER_HOST = SERVER_URL.replace(/^https?:\/\//, '');   // 只用于界面文案
-  const APP_VERSION = '1.2.0';        // 轻享版版本号（与 electron/package.json 保持一致）
+  const APP_VERSION = '1.3.0';        // 轻享版版本号（与 electron/package.json 保持一致）
   const ZWSP = '​';
   const LEVEL_FONT_ROOT = 18, LEVEL_FONT_TOP = 16, LEVEL_FONT_STEP = 1, LEVEL_FONT_MIN = 13;
   /* MAP_ROW 是「向下分类图 / 组织结构图」的**最小**层间距，不是固定层间距 ——
