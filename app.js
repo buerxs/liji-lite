@@ -26,7 +26,7 @@
     return 'http://127.0.0.1:5173';
   })();
   const SERVER_HOST = SERVER_URL.replace(/^https?:\/\//, '');   // 只用于界面文案
-  const APP_VERSION = '1.3.1';        // 轻享版版本号（与 electron/package.json 保持一致）
+  const APP_VERSION = '1.4.0';        // 轻享版版本号（与 electron/package.json 保持一致）
   const ZWSP = '​';
   const LEVEL_FONT_ROOT = 18, LEVEL_FONT_TOP = 16, LEVEL_FONT_STEP = 1, LEVEL_FONT_MIN = 13;
   /* MAP_ROW 是「向下分类图 / 组织结构图」的**最小**层间距，不是固定层间距 ——
@@ -140,6 +140,7 @@
     showColorPanel: false,
     showExportPanel: false,
     showLevelMenu: false,
+    drawerOpen: false,   /* 窄屏左侧抽屉（≤768px）：☰ 打开，点遮罩/导航项合上；桌面端侧栏常驻不用它 */
     /* 多选批量（2026-09-25）：批量升降级与单选走同一条校验（见 planLevelShift）。
        只是临时 UI 态，不落盘 —— saveNow 只存 documents/folders/activeDocId。 */
     multiSel: false,
@@ -220,11 +221,6 @@
           { id: 221, text: '客户邮件', level: 2, children: [] }
         ]
       }
-    ],
-    posts: [
-      { title: '一周高效复盘法', author: '林间写字', description: '一份能真正坚持的复盘大纲，从事件到行动。', template: '复盘模板', likes: 826, color: '#E6F4EA' },
-      { title: '旅行行前清单', author: '南方候鸟', description: '把行程、物品、预算放进一个清爽的计划。', template: '计划模板', likes: 415, color: '#FFF0D9' },
-      { title: '读书笔记：深度工作', author: 'Nora', description: '章节框架、摘录与可执行的实践清单。', template: '读书笔记', likes: 263, color: '#E8EEFF' }
     ]
   };
   let idSeed = 0;
@@ -234,6 +230,9 @@
   let pendingMapSel = null; // {s,e} 导图「改文字」框里待还原的选区（行内样式作用于选区后要放回去）
   let mapSelSnapshot = null; // {s,e,text} 按工具条按钮那一刻导图改文字框里的选区（点色板会重渲染，活选区会没）
   let rowSelSnapshot = null; // {s,e,id} 同上，大纲编辑行那一份
+  let rowCaretSnapshot = null; // {e,id} 只有光标没有选区时存光标位置（与 rowSelSnapshot 互斥：有选区存选区、只有光标存光标）
+  let recentColors = [];   // 最近使用过的自定义/基础色（会话内记忆，最多 8 个，色板顶部一排）
+  let cpHue = 96, cpLight = 45;  // 线性取色器的两个滑条状态（打开色板保留上次位置）
   let toastTimer = -1, toastEl = null;   // 提示条就地改 DOM，不参与整体重渲染（见 showNotice）
   let cloudTimer = -1;      // 云端推送防抖
   let docsDirty = false;    // 本机有还没推上云端的改动（必须落盘，见 markDocsDirty）
@@ -303,10 +302,17 @@
     const rt = activeRowInput();
     if (rt) {
       const sel = selOfEditable(rt);
+      const rid = Number(rt.getAttribute('data-id')) || S.editingRowId;
       if (sel && sel.e > sel.s) {
-        rowSelSnapshot = { s: sel.s, e: sel.e, id: Number(rt.getAttribute('data-id')) || S.editingRowId };
+        rowSelSnapshot = { s: sel.s, e: sel.e, id: rid };
+        rowCaretSnapshot = null;   // 互斥：真有活选区，光标快照作废
+      } else if (sel && rt === document.activeElement) {
+        /* 只有光标没有选区：存光标位置（行中间选完颜色后光标回原位、之后输入的字带色，
+           不再一律按「行尾」处理）。同样只在编辑框持有焦点时才覆盖，别把已有快照冲掉。 */
+        rowCaretSnapshot = { e: sel.e, id: rid };
+        rowSelSnapshot = null;
       }
-      S.editingRowId = Number(rt.getAttribute('data-id')) || S.editingRowId;
+      S.editingRowId = rid;
     }
     e.preventDefault();
   }, false);
@@ -1862,7 +1868,7 @@
   /* 焦点漏斗：谁要被聚焦，谁就同时进入编辑态（双态行只有在编辑态才有 textarea） */
   function setFocus(id, caret) {
     S.editingRowId = id;
-    rowSelSnapshot = null;   // 换了行，上一行的选区快照作废
+    rowSelSnapshot = null; rowCaretSnapshot = null;   // 换了行，上一行的选区/光标快照作废
     pendingFocus = { id, caret: caret === undefined ? 'end' : caret };
   }
   /* 当前真正被编辑的那个富文本框：焦点在哪它就是哪个（contenteditable 聚焦时 activeElement 就是它）。
@@ -1923,7 +1929,11 @@
     return {
       node: node, host: host, mapEdit: false, id: id,
       sel: live ? { s: live.s, e: live.e } : null,
-      caret: sel ? sel.e : String(node.text || '').length
+      /* 光标位置：活选区尾 > 光标快照 > 行尾。没有光标快照就一律按行尾，会让
+         「行中间选颜色」把光标跳到行尾、待输入样式记错位置。 */
+      caret: sel ? sel.e
+        : ((rowCaretSnapshot && rowCaretSnapshot.id === id && rowCaretSnapshot.e <= String(node.text || '').length)
+          ? rowCaretSnapshot.e : String(node.text || '').length)
     };
   }
   function editingSelRange() { const c = styleContext(); return c ? c.sel : null; }
@@ -1949,7 +1959,7 @@
     else if (patch.fzDelta) cs.fz = Math.min(40, Math.max(12, cs.fz + patch.fzDelta));
     S.caretStyle = cs; S.caretStyleId = ctx.node.id;
     if (ctx.mapEdit) { S.mapEditing = true; pendingMapSel = { s: ctx.caret, e: ctx.caret }; }
-    else refocusSel(ctx.node.id, ctx.caret, ctx.caret);
+    else { refocusSel(ctx.node.id, ctx.caret, ctx.caret); rowCaretSnapshot = null; }  // 快照已消费
     render();
     showNotice(msg(cs));
   }
@@ -1975,7 +1985,7 @@
     }
     patchNode(n.id, x => applyRunPatch(x, sel.s, sel.e, patch));
     refocusSel(n.id, sel.s, sel.e);
-    rowSelSnapshot = null;
+    rowSelSnapshot = null; rowCaretSnapshot = null;
     render();
   }
   /* 行内样式应用后的重渲染：把光标与选区放回原位 */
@@ -2342,7 +2352,7 @@
       const oldT = String(n.text || '');
       const next = String(value === undefined || value === null ? '' : value);
       if (next === oldT) return;
-      rowSelSnapshot = null;                                   // 文字变了，旧选区快照的偏移作废
+      rowSelSnapshot = null; rowCaretSnapshot = null;          // 文字变了，旧选区/光标快照的偏移作废
       if (nodeRuns(n).length) n.runs = shiftRuns(oldT, next, n.runs);
       n.text = next;
       /* 「之后输入的字用这个样式」（Word 逻辑）：新写进去的那一段按 S.caretStyle 上色。
@@ -2374,8 +2384,23 @@
   function changeColor(color) {
     const ctx = styleContext();
     if (!ctx) { showNotice('请先把光标放到主题文字里，或选中要改的那几个字'); return; }
+    pushRecentColor(color);
     if (ctx.sel) return applyRunFromSel(ctx.node, ctx.sel, { c: color });
     applyCaretStyle(ctx, { c: color }, cs => cs.c ? '之后输入的字用新颜色' : '之后输入的字跟随主题颜色');
+  }
+  /* 最近使用色：去重、置顶、封顶 8 个 */
+  function pushRecentColor(c) {
+    if (!c) return;
+    recentColors = [c].concat(recentColors.filter(x => x !== c)).slice(0, 8);
+  }
+  /* HSL（饱和度固定 62%）→ #RRGGBB，给线性取色器的预览与应用 */
+  function hslToHex(h, l) {
+    const s = 62 / 100, lf = l / 100;
+    const k = n => (n + h / 30) % 12;
+    const a = s * Math.min(lf, 1 - lf);
+    const f = n => lf - a * Math.max(-1, Math.min(k(n) - 3, Math.min(9 - k(n), 1)));
+    const to = x => Math.round(255 * x).toString(16).padStart(2, '0');
+    return '#' + to(f(0)) + to(f(8)) + to(f(4));
   }
   function zoomFont(delta) {
     const ctx = styleContext();
@@ -2501,6 +2526,9 @@
   }
   function header(title, action) {
     return div('header', null, [
+      /* ☰ 抽屉开关：只在窄屏（≤768px）显示（桌面 .menu-btn{display:none}）。
+         放在 h1 前面 —— 和手机 app 一样，左上角管导航。 */
+      div('menu-btn', { title: '打开导航抽屉', onclick: () => { S.drawerOpen = true; render(); } }, '☰'),
       el('h1', null, null, title),
       /* 轻享版没有服务端可刷，页头这个按钮就是「立刻同步一次」：
          把本机没传上去的推上去，再把云端新的拉回来。 */
@@ -2756,27 +2784,6 @@
       item.desc ? div('doc-desc', null, item.desc) : null,
       div('meta', null, [div(null, { style: { fontSize: '16px', color: '#8B9891' } }, '☷'), div(null, null, nodeCount(item.nodes) + ' 个节点')])
     ]);
-  }
-
-  /* ============================== 视图：社区 ============================== */
-  function CommunityPage() {
-    const wrap = div('screen');
-    wrap.appendChild(header('社区', ''));
-    wrap.appendChild(div('muted', { style: { fontSize: '14px', padding: '0 24px 18px' } }, '从他人的结构中，获得新的思路'));
-    const list = div('list');
-    S.posts.forEach(post => {
-      const row = div('post', null, [
-        div('post-icon', { style: { background: post.color } }, '☷'),
-        div('post-body', null, [
-          div('post-title', null, [document.createTextNode(post.title), div('muted', { style: { marginLeft: 'auto', fontSize: '12px' } }, '♡ ' + post.likes)]),
-          div('post-desc', null, post.description),
-          div('post-foot', null, [div(null, null, post.author), div('tpl', null, post.template)])
-        ])
-      ]);
-      list.appendChild(row);
-    });
-    wrap.appendChild(list);
-    return wrap;
   }
 
   /* ============================== 视图：个人中心（同步与存储） ==============================
@@ -3070,12 +3077,11 @@
       div(null, null, [div('brand-title', null, '理记'), div('brand-sub', null, '理清每一件重要的事')])
     ]));
     const nav = div('side-nav');
-    const item = (ic, label, target) => div('side-item' + (S.tab === target ? ' active' : ''), { onclick: () => { S.tab = target; render(); } }, [
+    const item = (ic, label, target) => div('side-item' + (S.tab === target ? ' active' : ''), { onclick: () => { S.tab = target; S.drawerOpen = false; render(); } }, [
       div('ic', null, ic),
       div('lb', null, label)
     ]);
     nav.appendChild(item('⌂', '我的文档', '首页'));
-    nav.appendChild(item('◈', '社区', '社区'));
     nav.appendChild(item('◉', '同步与存储', '个人中心'));
     side.appendChild(nav);
     /* 左下角的「＋ 新建文档」已移除（2026-10-08，与云端版同步）：顶部 Header 本来就有「＋ 新建」，
@@ -3878,15 +3884,59 @@
   function colorPanel() {
     const overlay = div('color-panel');
     overlay.appendChild(div('mask', { style: { flex: '1' }, onclick: () => { S.showColorPanel = false; render(); } }));
+    const active = currentColor();
+    /* ★ 先关面板再改色：changeColor 内部会 render 并还原光标/焦点，
+       如果外层再 render 一次，刚还原的光标就被冲掉了（只 render 一次）。 */
+    const pick = c => () => { S.showColorPanel = false; changeColor(c); };
+    /* 最近使用（会话内记忆，最多 8 个） */
+    if (recentColors.length) {
+      const sec = div('cp-section');
+      sec.appendChild(div('cp-label', null, '最近使用'));
+      const row = div('color-row');
+      recentColors.slice(0, 8).forEach(c => {
+        row.appendChild(div('swatch-wrap' + (active === c ? ' sel' : ''), { onclick: pick(c) }, [div('swatch', { style: { background: c } })]));
+      });
+      sec.appendChild(row);
+      overlay.appendChild(sec);
+    }
+    /* 基础色两行（原有 10 色） */
     const grid = div('color-grid');
     [0, 1].forEach(r => {
       const row = div('color-row');
       colorRow(r).forEach(item => {
-        row.appendChild(div('swatch-wrap' + (currentColor() === item.value ? ' sel' : ''), { onclick: () => { changeColor(item.value); S.showColorPanel = false; render(); } }, [div('swatch', { style: { background: item.value } })]));
+        row.appendChild(div('swatch-wrap' + (active === item.value ? ' sel' : ''), { onclick: pick(item.value) }, [div('swatch', { style: { background: item.value } })]));
       });
       grid.appendChild(row);
     });
     overlay.appendChild(grid);
+    /* 线性取色器：色相 + 深浅两条滑条，实时预览，点「应用此颜色」生效 */
+    const sec2 = div('cp-section');
+    sec2.appendChild(div('cp-label', null, '自定义颜色'));
+    const pvWrap = div('cp-preview', null, [
+      div('cp-pv-chip', { style: { background: hslToHex(cpHue, cpLight) } }),
+      div('cp-pv-hex', null, hslToHex(cpHue, cpLight))
+    ]);
+    const mkSlider = (cls, label, min, max, val, oninput) => {
+      const line = div('cp-line', null, [
+        div('cp-lb', null, label),
+        el('input', 'cp-track ' + cls, { type: 'range', min: String(min), max: String(max), value: String(val), oninput: oninput })
+      ]);
+      return line;
+    };
+    const pvChip = pvWrap.querySelector('.cp-pv-chip');
+    const pvHex = pvWrap.querySelector('.cp-pv-hex');
+    const refreshPv = () => {
+      const hex = hslToHex(cpHue, cpLight);
+      pvChip.style.background = hex;
+      pvHex.textContent = hex;
+    };
+    sec2.appendChild(pvWrap);
+    sec2.appendChild(mkSlider('hue', '色相', 0, 360, cpHue, e => { cpHue = Number(e.target.value); refreshPv(); }));
+    sec2.appendChild(mkSlider('light', '深浅', 30, 80, cpLight, e => { cpLight = Number(e.target.value); refreshPv(); }));
+    sec2.appendChild(div('cp-apply-row', null, [
+      el('button', 'cp-apply', { onclick: () => { S.showColorPanel = false; changeColor(hslToHex(cpHue, cpLight)); } }, '应用此颜色')
+    ]));
+    overlay.appendChild(sec2);
     return overlay;
   }
   function exportPanel() {
@@ -4732,11 +4782,14 @@
     else {
       const main = div('main');
       if (S.tab === '首页') main.appendChild(HomePage());
-      else if (S.tab === '社区') main.appendChild(CommunityPage());
       else main.appendChild(ProfilePage());
-      screen = div('app-shell');
+      screen = div('app-shell' + (S.drawerOpen ? ' drawer-open' : ''));
       screen.appendChild(Sidebar());
       screen.appendChild(main);
+      /* 抽屉开着时盖一层遮罩：点它收起（窄屏专用，桌面遮罩不存在因为 drawerOpen 只在窄屏交互里置 true） */
+      if (S.drawerOpen) {
+        screen.appendChild(div('drawer-mask', { onclick: () => { S.drawerOpen = false; render(); } }));
+      }
     }
     appEl.appendChild(screen);
     if (S.showTemplateSheet) appEl.appendChild(TemplateSheet());    /* 导出 PDF 超页的确认弹窗盖在模板浮层之上 —— 它问的是「这一步要不要继续」，不能被挡住 */

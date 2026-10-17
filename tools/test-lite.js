@@ -172,8 +172,8 @@ function makeCdp(wsUrl) {
   check('标题是「理记-轻享版」', noLogin.title === '理记-轻享版', noLogin.title);
   check('没有登录表单', noLogin.hasLoginForm === false);
   check('没有「离线体验」这类账号兜底入口', noLogin.hasOfflineNote === false);
-  check('侧边导航只剩三页（无公告 / 无账号）',
-    JSON.stringify(noLogin.tabs) === JSON.stringify(['我的文档', '社区', '同步与存储']), JSON.stringify(noLogin.tabs));
+  check('侧边导航只剩两页（社区已取消、无公告 / 无账号）',
+    JSON.stringify(noLogin.tabs) === JSON.stringify(['我的文档', '同步与存储']), JSON.stringify(noLogin.tabs));
   check('对象存储客户端已加载（三家协议）', noLogin.hasOss && noLogin.providers.length === 3, JSON.stringify(noLogin.providers));
 
   /* ---------- ② 文档存本机：新建 → 刷新 → 仍在 ---------- */
@@ -799,6 +799,109 @@ function makeCdp(wsUrl) {
   check('恢复成功：内容以副本形式回到文档库并推送', recDone.ok === true
     && recDoc.title.indexOf('回收站目标文档（恢复') === 0 && recDoc.nodes > 0, JSON.stringify(recDoc));
   srv.setVersioning(false);
+
+  /* ---------- ⑫¼ 颜色 Word 逻辑 / 线性取色器 / 侧边抽屉（2026-10-17，与云端版同步）----------
+   * 无选区点色块 = 只记「之后输入的字的颜色」（caretStyle），光标回原位，已有文字一个字节不动；
+   * 色板带色相/深浅双滑条实时预览 + 最近使用；窄屏左侧栏收进抽屉（☰ / 遮罩 / 选项自动合上）。 */
+  await cdp.eval(`
+    var L = window.__liji;
+    L.createDocument('空白文档');
+    var d = L.S.documents[0];              // createDocument 把新文档插在最前
+    d.title = '颜色自检';
+    d.nodes = [{ id: 990001, text: '甲乙丙丁', level: 1, children: [] }];
+    L.S.activeDocId = d.id;
+    L.openDocument(d.id); L.S.editorView = '编辑'; L.render();
+    return true;`);
+  /* 光标放行中间（偏移 2，无选区），然后对「颜色」按钮派发真 mousedown ——
+     快照就是在这一下抓的（mousedown preventDefault 挡焦点转移，行还持有焦点）。 */
+  const caret1 = await cdp.eval(`
+    var btn = [].slice.call(document.querySelectorAll('.tool-btn')).filter(function (b) { return b.textContent.indexOf('颜色') >= 0; })[0];
+    var row = document.querySelector('.row-input[data-id="990001"]');
+    /* 行内第一个 ≥2 字的文本节点才是文字本体（行里可能混着占位/装饰节点） */
+    var tn = null;
+    (function walk(n) { if (tn) return;
+      for (var i = 0; i < n.childNodes.length; i++) { var c = n.childNodes[i];
+        if (c.nodeType === 3 && c.textContent.length >= 2) { tn = c; return; } walk(c); } })(row);
+    row.focus();
+    var r = document.createRange(); r.setStart(tn, 2); r.collapse(true);
+    var s = window.getSelection(); s.removeAllRanges(); s.addRange(r);
+    btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    return { off: window.getSelection().getRangeAt(0).startOffset, text: row.textContent };`);
+  check('光标放在行中间（偏移 2，无选区）', caret1.off === 2, JSON.stringify(caret1));
+  await cdp.eval(`
+    var btn = [].slice.call(document.querySelectorAll('.tool-btn')).filter(function (b) { return b.textContent.indexOf('颜色') >= 0; })[0];
+    btn.click(); return true;`);
+  const panel1 = await cdp.eval(`return {
+    hue: !!document.querySelector('.color-panel .cp-track.hue'),
+    light: !!document.querySelector('.color-panel .cp-track.light'),
+    apply: !!document.querySelector('.color-panel .cp-apply'),
+    swatches: document.querySelectorAll('.color-grid .swatch-wrap').length };`);
+  check('色板里有线性取色器（色相 + 深浅滑条 + 应用按钮）',
+    panel1.hue && panel1.light && panel1.apply, JSON.stringify(panel1));
+  check('基础色 10 块还在', panel1.swatches === 10, String(panel1.swatches));
+  await cdp.eval(`document.querySelector('.color-grid .swatch-wrap').click(); return true;`);
+  const after1 = await cdp.eval(`return (function () {
+    var L = window.__liji;
+    var n = L.S.documents[0].nodes[0];
+    var row = document.querySelector('.row-input[data-id="990001"]');
+    var off = -1;
+    try { off = window.getSelection().getRangeAt(0).startOffset; } catch (e) {}
+    return { runs: (n.runs || []).length, cs: L.S.caretStyle ? L.S.caretStyle.c : null,
+      panelOpen: L.S.showColorPanel, off: off, focused: document.activeElement === row }; })();`);
+  check('无选区点色块：已有文字一个字节没动（runs 为空）', after1.runs === 0, JSON.stringify(after1));
+  check('无选区点色块：记成「之后输入的字的颜色」', !!after1.cs, String(after1.cs));
+  check('色板自动收起', after1.panelOpen === false);
+  check('光标回到原位（偏移 2）且行仍持有焦点', after1.off === 2 && after1.focused === true,
+    'off=' + after1.off + ' focused=' + after1.focused);
+  /* 重开色板：最近使用一排应出现刚用过的颜色 */
+  await cdp.eval(`
+    var btn = [].slice.call(document.querySelectorAll('.tool-btn')).filter(function (b) { return b.textContent.indexOf('颜色') >= 0; })[0];
+    btn.click(); return true;`);
+  const recent = await cdp.eval(`return {
+    section: !!document.querySelector('.color-panel .cp-section'),
+    n: document.querySelectorAll('.color-panel .cp-section .swatch-wrap').length };`);
+  check('重开色板：最近使用一排出现了刚用过的颜色', recent.section && recent.n >= 1, JSON.stringify(recent));
+  /* 自定义色：拖色相滑条 → 预览实时变 → 应用生效 */
+  await cdp.eval(`
+    var hue = document.querySelector('.color-panel .cp-track.hue');
+    hue.value = 200; hue.dispatchEvent(new Event('input', { bubbles: true })); return true;`);
+  const hex = await cdp.eval(`return document.querySelector('.color-panel .cp-pv-hex').textContent;`);
+  check('拖色相滑条：预览实时变成对应 hex', /^#[0-9a-fA-F]{6}$/.test(hex), hex);
+  await cdp.eval(`document.querySelector('.color-panel .cp-apply').click(); return true;`);
+  const after2 = await cdp.eval(`return {
+    cs: window.__liji.S.caretStyle ? window.__liji.S.caretStyle.c : null,
+    panel: window.__liji.S.showColorPanel };`);
+  check('「应用此颜色」把自定义色记到待输入样式', after2.cs === hex.toLowerCase(), after2.cs + ' / ' + hex);
+  check('应用后色板收起', after2.panel === false);
+  /* 抽屉：压到 390×844 再测（桌面常驻侧栏是另一形态，视口够宽时根本测不到） */
+  await cdp.eval(`window.__liji.S.showEditor = false; window.__liji.S.tab = '首页'; window.__liji.render(); return true;`);
+  await cdp.send('Emulation.setDeviceMetricsOverride', { width: 390, height: 844, deviceScaleFactor: 1, mobile: true });
+  await sleep(400);   // 等 .sidebar 的 translateX 过渡走完（220ms），别量在半路上
+  const drawer0 = await cdp.eval(`return (function () {
+    var b = document.querySelector('.header .menu-btn');
+    var side = document.querySelector('.sidebar');
+    var rect = side.getBoundingClientRect();
+    return { menu: !!b && b.offsetWidth > 0, out: Math.round(rect.right),
+      open: document.querySelector('.app-shell').className.indexOf('drawer-open') >= 0 }; })();`);
+  check('窄屏下 ☰ 可见、抽屉收在屏幕外', drawer0.menu && drawer0.out <= 0 && !drawer0.open, JSON.stringify(drawer0));
+  await cdp.eval(`document.querySelector('.header .menu-btn').click(); return true;`);
+  const drawer1 = await cdp.eval(`return {
+    open: document.querySelector('.app-shell').className.indexOf('drawer-open') >= 0,
+    mask: !!document.querySelector('.drawer-mask') };`);
+  check('点 ☰：抽屉滑入且遮罩出现', drawer1.open && drawer1.mask, JSON.stringify(drawer1));
+  await cdp.eval(`document.querySelector('.drawer-mask').click(); return true;`);
+  const drawer2 = await cdp.eval(`return document.querySelector('.app-shell').className.indexOf('drawer-open') < 0;`);
+  check('点遮罩：抽屉收起', drawer2 === true);
+  await cdp.eval(`
+    document.querySelector('.header .menu-btn').click();
+    var it = [].slice.call(document.querySelectorAll('.side-item')).filter(function (n) { return n.textContent.indexOf('同步与存储') >= 0; })[0];
+    it.click(); return true;`);
+  const drawer3 = await cdp.eval(`return {
+    tab: window.__liji.S.tab,
+    open: document.querySelector('.app-shell').className.indexOf('drawer-open') >= 0 };`);
+  check('点抽屉里的导航项：跳页且抽屉自动合上', drawer3.tab === '个人中心' && drawer3.open === false, JSON.stringify(drawer3));
+  await cdp.send('Emulation.clearDeviceMetricsOverride');
+  await cdp.eval(`window.__liji.S.tab = '首页'; window.__liji.render(); return true;`);
 
   /* ---------- ⑫ 收尾：页面没有报错 ---------- */
   collectErrors();
