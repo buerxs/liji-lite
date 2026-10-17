@@ -26,7 +26,7 @@
     return 'http://127.0.0.1:5173';
   })();
   const SERVER_HOST = SERVER_URL.replace(/^https?:\/\//, '');   // 只用于界面文案
-  const APP_VERSION = '1.4.0';        // 轻享版版本号（与 electron/package.json 保持一致）
+  const APP_VERSION = '1.4.1';        // 轻享版版本号（与 electron/package.json 保持一致）
   const ZWSP = '​';
   const LEVEL_FONT_ROOT = 18, LEVEL_FONT_TOP = 16, LEVEL_FONT_STEP = 1, LEVEL_FONT_MIN = 13;
   /* MAP_ROW 是「向下分类图 / 组织结构图」的**最小**层间距，不是固定层间距 ——
@@ -2348,6 +2348,7 @@
     showNotice(pNow > 0 ? ('上级为标题' + pNow + '，最低只能降到标题' + (pNow + 1) + '，已保持在标题' + cur) : ('向下没有可用的级别，已保持在标题' + cur));
   }
   function updateNodeText(id, value) {
+    let caretPut = -1;   // ≥0 = 本次发生了「待输入样式落地」的插入，打完补丁要重画行 + 光标放回插入终点
     patchNode(id, n => {
       const oldT = String(n.text || '');
       const next = String(value === undefined || value === null ? '' : value);
@@ -2360,9 +2361,17 @@
       const cs = (S.caretStyle && S.caretStyleId === id) ? S.caretStyle : null;
       if (cs) {
         const d = insertRange(oldT, next);
-        if (d.e > d.s) applyRunPatch(n, d.s, d.e, { abs: true, b: cs.b, u: cs.u, c: cs.c, fz: cs.fz });
+        if (d.e > d.s) {
+          applyRunPatch(n, d.s, d.e, { abs: true, b: cs.b, u: cs.u, c: cs.c, fz: cs.fz });
+          caretPut = d.e;
+        }
       }
     });
+    /* ★ 光标落在异色 run 的边界上打字时，浏览器会把新字符直接插进那个颜色的 span 里
+       （contenteditable 原生行为），数据层 runs 是对的、**视觉却是旧颜色** —— 用户看到的
+       就是「设了黑打出来还是红」。所以待输入样式一落地就重画行 DOM（从 runs 生成 span），
+       并把光标放回插入终点。组合输入期间不进来（isComposing 已在 oninput 处挡掉）。 */
+    if (caretPut >= 0) { refocusSel(id, caretPut, caretPut); render(); }
   }
   /* 样式按钮的统一入口（Word 逻辑，2026-09-23 起）：
      · 有选区   → 只改选中的那几个字（runs）

@@ -903,6 +903,96 @@ function makeCdp(wsUrl) {
   await cdp.send('Emulation.clearDeviceMetricsOverride');
   await cdp.eval(`window.__liji.S.tab = '首页'; window.__liji.render(); return true;`);
 
+  /* ---------- ⑫¼½ 用户流回归（2026-10-17）：选区设红 → 收拢光标设黑 → 打字 ----------
+   * 病根：caretStyle 补丁落在数据后不重画行 DOM，浏览器把新字符插进光标所在的**红 span**
+   * （contenteditable 原生行为）——数据对、视觉错，「设了黑打出来还是红」。
+   * 断言必须验**视觉**（X 所在 span 的 computed color），只看 runs 挡不住这个病。 */
+  await cdp.eval(`
+    var L = window.__liji;
+    var d = L.S.documents.filter(function (x) { return x.title === '颜色自检'; })[0];
+    d.nodes = [{ id: 990001, text: '甲乙丙丁', level: 1, children: [] }];
+    L.S.activeDocId = d.id; L.S.caretStyle = null; L.S.caretStyleId = 0;
+    L.openDocument(d.id); L.S.editorView = '编辑'; L.render();
+    return true;`);
+  /* 跨 span 定位：行被 runs 渲染成多个 span 后，文本节点变短，必须按总偏移摊平找节点 */
+  const placeCaret = (a, b) => `
+    var row = document.querySelector('.row-input[data-id="990001"]');
+    var tns = [];
+    (function walk(n) {
+      for (var i = 0; i < n.childNodes.length; i++) { var c = n.childNodes[i];
+        if (c.nodeType === 3) tns.push(c); else walk(c); } })(row);
+    function locate(off) {
+      var acc = 0;
+      for (var j = 0; j < tns.length; j++) {
+        if (off <= acc + tns[j].textContent.length) return { n: tns[j], o: off - acc };
+        acc += tns[j].textContent.length;
+      }
+      return { n: tns[tns.length - 1], o: tns[tns.length - 1].textContent.length };
+    }
+    row.focus();
+    var p1 = locate(${a});
+    var r = document.createRange(); r.setStart(p1.n, p1.o);
+    ${b === null ? 'r.collapse(true);' : 'var p2 = locate(' + b + '); r.setEnd(p2.n, p2.o);'}
+    var s = window.getSelection(); s.removeAllRanges(); s.addRange(r); return true;`;
+  const colorBtnJs = `
+    var btn = [].slice.call(document.querySelectorAll('.tool-btn')).filter(function (b) { return b.textContent.indexOf('颜色') >= 0; })[0];
+    btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    btn.click(); return true;`;
+  const clickSwatchJs = (i) => `
+    var sw = document.querySelectorAll('.color-grid .swatch-wrap')[${i}];
+    sw.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+    sw.click(); return true;`;
+  /* ① 选中 [1,3) 设红（朱红 = 色板第 3 块） */
+  await cdp.eval(placeCaret(1, 3));
+  await cdp.eval(colorBtnJs);
+  await cdp.eval(clickSwatchJs(2));
+  const redApplied = await cdp.eval(`return (function () {
+    var n = window.__liji.S.documents.filter(function (x) { return x.title === '颜色自检'; })[0].nodes[0];
+    return JSON.stringify(n.runs || []); })();`);
+  check('① 选区 [1,3) 设红：runs 记下朱红', redApplied.indexOf('#C0392B') >= 0, redApplied);
+  /* ② 收拢光标到总偏移 3（红字后面），设黑（墨黑 = 第 1 块） */
+  await cdp.eval(placeCaret(3, null));
+  await cdp.eval(colorBtnJs);
+  await cdp.eval(clickSwatchJs(0));
+  const blackSet = await cdp.eval(`return (function () {
+    var L = window.__liji;
+    return { cs: L.S.caretStyle ? L.S.caretStyle.c : null,
+      runs: JSON.stringify(L.S.documents.filter(function (x) { return x.title === '颜色自检'; })[0].nodes[0].runs || []) }; })();`);
+  check('② 光标态设墨黑：只记待输入样式，已有文字不动（仍是朱红）',
+    blackSet.cs === '#1F2A2A' && blackSet.runs.indexOf('#C0392B') >= 0 && blackSet.runs.indexOf('"e":3') >= 0,
+    JSON.stringify(blackSet));
+  /* ③ 真打字（CDP Input.insertText = 真实键盘插入），断言视觉 */
+  await cdp.send('Input.insertText', { text: 'X' });
+  await sleep(250);
+  const typedX = await cdp.eval(`return (function () {
+    var L = window.__liji;
+    var n = L.S.documents.filter(function (x) { return x.title === '颜色自检'; })[0].nodes[0];
+    var row = document.querySelector('.row-input[data-id="990001"]');
+    var xi = String(n.text).indexOf('X');
+    var tn = null;
+    (function walk(nd) { if (tn) return;
+      for (var i = 0; i < nd.childNodes.length; i++) { var c = nd.childNodes[i];
+        if (c.nodeType === 3 && c.textContent.indexOf('X') >= 0) { tn = c; return; } walk(c); } })(row);
+    var col = tn ? getComputedStyle(tn.parentElement).color : 'no-node';
+    return { text: n.text, runs: JSON.stringify(n.runs || []), xColor: col }; })();`);
+  check('③ 打出的 X：数据层记为墨黑', typedX.text === '甲乙丙X丁'
+    && typedX.runs.indexOf('"s":3,"e":4,"c":"#1F2A2A"') >= 0, JSON.stringify(typedX));
+  check('③ 打出的 X：**视觉**上就是墨黑（修复点：待输入样式落地后重画行 DOM）',
+    /rgb\(31,\s*42,\s*42\)/.test(typedX.xColor), typedX.xColor);
+  /* ④ 紧接着再打一个字：仍应落在黑 span（光标停在插入终点） */
+  await cdp.send('Input.insertText', { text: 'Y' });
+  await sleep(250);
+  const typedY = await cdp.eval(`return (function () {
+    var n = window.__liji.S.documents.filter(function (x) { return x.title === '颜色自检'; })[0].nodes[0];
+    var row = document.querySelector('.row-input[data-id="990001"]');
+    var tn = null;
+    (function walk(nd) { if (tn) return;
+      for (var i = 0; i < nd.childNodes.length; i++) { var c = nd.childNodes[i];
+        if (c.nodeType === 3 && c.textContent.indexOf('Y') >= 0) { tn = c; return; } walk(c); } })(row);
+    return { text: n.text, yColor: tn ? getComputedStyle(tn.parentElement).color : 'no-node' }; })();`);
+  check('④ 连续打的 Y 也在墨黑里，光标跟手', typedY.text === '甲乙丙XY丁'
+    && /rgb\(31,\s*42,\s*42\)/.test(typedY.yColor), JSON.stringify(typedY));
+
   /* ---------- ⑫ 收尾：页面没有报错 ---------- */
   collectErrors();
   const real = pageErrors.filter(e => !/favicon|net::ERR_/.test(e));
