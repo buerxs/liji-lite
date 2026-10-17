@@ -861,6 +861,28 @@ function makeCdp(wsUrl) {
     section: !!document.querySelector('.color-panel .cp-section'),
     n: document.querySelectorAll('.color-panel .cp-section .swatch-wrap').length };`);
   check('重开色板：最近使用一排出现了刚用过的颜色', recent.section && recent.n >= 1, JSON.stringify(recent));
+  /* 真指针拖滑条（2026-10-17 用户报「滑块拖不动」，与云端版同步的回归断言）：
+     全局 mousedown 曾对色板内一律 preventDefault，吞掉 range 原生拖动 ——
+     直接设 value + 派发 input 绕过了真指针，这病暴露不了，必须真拖。 */
+  const hueDrag0 = await cdp.eval(`return (function () {
+    var t = document.querySelector('.color-panel .cp-track.hue');
+    if (!t) return { err: '无滑条' };
+    var r = t.getBoundingClientRect();
+    return { x0: Math.round(r.left + r.width * 0.3), x1: Math.round(r.left + r.width * 0.7),
+      y: Math.round(r.top + r.height / 2), v0: Number(t.value) }; })();`);
+  await cdp.send('Input.dispatchMouseEvent', { type: 'mousePressed', x: hueDrag0.x0, y: hueDrag0.y, button: 'left', buttons: 1, clickCount: 1 });
+  for (let i = 1; i <= 6; i++) {
+    await cdp.send('Input.dispatchMouseEvent', { type: 'mouseMoved', x: Math.round(hueDrag0.x0 + (hueDrag0.x1 - hueDrag0.x0) * i / 6), y: hueDrag0.y, button: 'left', buttons: 1, clickCount: 1 });
+    await sleep(40);
+  }
+  await cdp.send('Input.dispatchMouseEvent', { type: 'mouseReleased', x: hueDrag0.x1, y: hueDrag0.y, button: 'left', buttons: 0, clickCount: 1 });
+  await sleep(200);
+  const hueDrag1 = await cdp.eval(`return {
+    v1: Number(document.querySelector('.color-panel .cp-track.hue').value),
+    hex: document.querySelector('.color-panel .cp-pv-hex').textContent };`);
+  check('真指针拖色相滑条：值跟着走、预览实时变（滑块拖得动）',
+    Math.abs(hueDrag1.v1 - hueDrag0.v0) > 20 && /^#[0-9a-fA-F]{6}$/.test(hueDrag1.hex),
+    'v0=' + hueDrag0.v0 + ' v1=' + hueDrag1.v1 + ' ' + hueDrag1.hex);
   /* 自定义色：拖色相滑条 → 预览实时变 → 应用生效 */
   await cdp.eval(`
     var hue = document.querySelector('.color-panel .cp-track.hue');
@@ -902,6 +924,36 @@ function makeCdp(wsUrl) {
   check('点抽屉里的导航项：跳页且抽屉自动合上', drawer3.tab === '个人中心' && drawer3.open === false, JSON.stringify(drawer3));
   await cdp.send('Emulation.clearDeviceMetricsOverride');
   await cdp.eval(`window.__liji.S.tab = '首页'; window.__liji.render(); return true;`);
+  /* 桌面端侧栏收起/展开（2026-10-17 用户报「桌面没有收起和展开功能」，与云端版同步）：
+     ☰ 全宽度可见；桌面点一下侧栏滑出屏外（无遮罩），再点一下恢复常驻。 */
+  await cdp.send('Emulation.setDeviceMetricsOverride', { width: 1280, height: 900, deviceScaleFactor: 1, mobile: false });
+  await sleep(300);
+  const dWide = await cdp.eval(`return (function () {
+    var b = document.querySelector('.header .menu-btn');
+    var side = document.querySelector('.sidebar');
+    if (!b || !side) return { err: '缺 menu-btn 或 sidebar' };
+    var r = side.getBoundingClientRect();
+    return { vw: innerWidth, menu: b.offsetWidth > 0, left: Math.round(r.left),
+      collapsed: document.querySelector('.app-shell').className.indexOf('side-collapsed') >= 0 }; })();`);
+  check('桌面端 ☰ 也可见、侧栏默认常驻（收起/展开回来了）',
+    dWide.vw > 768 && dWide.menu && dWide.left === 0 && !dWide.collapsed, JSON.stringify(dWide));
+  await cdp.eval(`document.querySelector('.header .menu-btn').click(); return true;`);
+  await sleep(400);
+  const dCol = await cdp.eval(`return (function () {
+    var r = document.querySelector('.sidebar').getBoundingClientRect();
+    return { right: Math.round(r.right),
+      collapsed: document.querySelector('.app-shell').className.indexOf('side-collapsed') >= 0,
+      mask: !!document.querySelector('.drawer-mask') }; })();`);
+  check('桌面点 ☰：侧栏收起（滑出屏外、无遮罩）', dCol.collapsed && dCol.right <= 0 && !dCol.mask, JSON.stringify(dCol));
+  await cdp.eval(`document.querySelector('.header .menu-btn').click(); return true;`);
+  await sleep(400);
+  const dExp = await cdp.eval(`return (function () {
+    var r = document.querySelector('.sidebar').getBoundingClientRect();
+    return { left: Math.round(r.left),
+      collapsed: document.querySelector('.app-shell').className.indexOf('side-collapsed') >= 0 }; })();`);
+  check('桌面再点 ☰：侧栏恢复常驻', !dExp.collapsed && dExp.left === 0, JSON.stringify(dExp));
+  await cdp.send('Emulation.clearDeviceMetricsOverride');
+  await sleep(300);
 
   /* ---------- ⑫¼½ 用户流回归（2026-10-17）：选区设红 → 收拢光标设黑 → 打字 ----------
    * 病根：caretStyle 补丁落在数据后不重画行 DOM，浏览器把新字符插进光标所在的**红 span**

@@ -50,11 +50,17 @@ input,textarea{font-family:inherit;}
 .side-new{width:100%;background:var(--moss);color:#fff;border-radius:12px;padding:12px;text-align:center;font-size:15px;font-weight:600;cursor:pointer;}
 .side-new:hover{filter:brightness(1.05);}
 
-/* ☰ 抽屉开关：桌面端隐藏（侧栏常驻），窄屏才显示（见下方媒体查询） */
-.menu-btn{display:none;width:38px;height:38px;border:none;background:transparent;color:var(--ink);
+/* ☰ 侧栏开关：全宽度可见（2026-10-17 与云端版同步）—— 窄屏开抽屉，桌面切换「常驻 ↔ 收起」 */
+.menu-btn{display:flex;align-items:center;justify-content:center;width:38px;height:38px;border:none;background:transparent;color:var(--ink);
   font-size:22px;line-height:1;cursor:pointer;border-radius:10px;flex:0 0 auto;}
 .menu-btn:hover{background:#F3F6F3;}
 .drawer-mask{position:absolute;inset:0;background:rgba(20,30,24,.35);z-index:85;}
+/* 桌面端收起态（>768px，JS 保证窄屏不会带 side-collapsed）：侧栏滑出屏外、内容区占满，无遮罩，再点 ☰ 恢复 */
+.app-shell.side-collapsed .sidebar{
+  position:fixed;left:0;top:0;bottom:0;z-index:90;width:228px;
+  transform:translateX(-105%);transition:transform .22s ease;
+  box-shadow:0 8px 30px rgba(20,30,24,.22);
+}
 
 /* ---------- 通用 ---------- */
 .screen{display:flex;flex-direction:column;width:100%;height:100%;flex:1;min-height:0;}

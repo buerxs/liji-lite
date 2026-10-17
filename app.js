@@ -26,7 +26,7 @@
     return 'http://127.0.0.1:5173';
   })();
   const SERVER_HOST = SERVER_URL.replace(/^https?:\/\//, '');   // 只用于界面文案
-  const APP_VERSION = '1.4.1';        // 轻享版版本号（与 electron/package.json 保持一致）
+  const APP_VERSION = '1.4.2';        // 轻享版版本号（与 electron/package.json 保持一致）
   const ZWSP = '​';
   const LEVEL_FONT_ROOT = 18, LEVEL_FONT_TOP = 16, LEVEL_FONT_STEP = 1, LEVEL_FONT_MIN = 13;
   /* MAP_ROW 是「向下分类图 / 组织结构图」的**最小**层间距，不是固定层间距 ——
@@ -140,7 +140,8 @@
     showColorPanel: false,
     showExportPanel: false,
     showLevelMenu: false,
-    drawerOpen: false,   /* 窄屏左侧抽屉（≤768px）：☰ 打开，点遮罩/导航项合上；桌面端侧栏常驻不用它 */
+    drawerOpen: false,   /* 窄屏左侧抽屉（≤768px）：☰ 打开，点遮罩/导航项合上 */
+    sideCollapsed: false, /* 桌面端（>768px）侧栏收起态：☰ 切换「常驻 ↔ 收起」，收起时侧栏滑出屏外 */
     /* 多选批量（2026-09-25）：批量升降级与单选走同一条校验（见 planLevelShift）。
        只是临时 UI 态，不落盘 —— saveNow 只存 documents/folders/activeDocId。 */
     multiSel: false,
@@ -314,8 +315,22 @@
       }
       S.editingRowId = rid;
     }
+    /* ★ 原生控件例外（2026-10-17 用户报「自定义颜色滑块拖不动」，与云端版同步）：
+       preventDefault 会吞掉 <input type=range> 的 mousedown 默认行为，取色器的滑块就再也拖不动了。
+       快照逻辑上面已经照走，这里只对非 input 的目标拦默认行为。 */
+    if (e.target && e.target.closest && e.target.closest('input')) return;
     e.preventDefault();
   }, false);
+
+  /* 跨断点清理（2026-10-17 桌面可收起侧栏，与云端版同步）：窗口从窄变宽时抽屉态要清掉
+     （drawer-open 在宽屏意味着「收起」，不清会把常驻侧栏藏没）；从宽变窄时清收起态。 */
+  if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('resize', () => {
+      const wide = window.innerWidth > 768;
+      if (wide && S.drawerOpen) { S.drawerOpen = false; render(); }
+      else if (!wide && S.sideCollapsed) { S.sideCollapsed = false; render(); }
+    });
+  }
 
   /* ★ 级别标签跟随光标（2026-09-25）：selectNode 是故意不 render 的 —— 点了行要接着打字，
      重渲染会把刚拿到的焦点抢走。代价是工具栏上的「标题N」/ 色点停留在**上次渲染**的那一行，
@@ -2535,9 +2550,16 @@
   }
   function header(title, action) {
     return div('header', null, [
-      /* ☰ 抽屉开关：只在窄屏（≤768px）显示（桌面 .menu-btn{display:none}）。
+      /* ☰ 侧栏开关：全宽度可见（2026-10-17 与云端版同步）。窄屏=打开抽屉；桌面=「常驻 ↔ 收起」切换。
          放在 h1 前面 —— 和手机 app 一样，左上角管导航。 */
-      div('menu-btn', { title: '打开导航抽屉', onclick: () => { S.drawerOpen = true; render(); } }, '☰'),
+      div('menu-btn', {
+        title: '切换侧栏',
+        onclick: () => {
+          if (window.innerWidth <= 768) S.drawerOpen = true;
+          else S.sideCollapsed = !S.sideCollapsed;
+          render();
+        }
+      }, '☰'),
       el('h1', null, null, title),
       /* 轻享版没有服务端可刷，页头这个按钮就是「立刻同步一次」：
          把本机没传上去的推上去，再把云端新的拉回来。 */
@@ -4792,7 +4814,7 @@
       const main = div('main');
       if (S.tab === '首页') main.appendChild(HomePage());
       else main.appendChild(ProfilePage());
-      screen = div('app-shell' + (S.drawerOpen ? ' drawer-open' : ''));
+      screen = div('app-shell' + (S.drawerOpen ? ' drawer-open' : '') + (S.sideCollapsed ? ' side-collapsed' : ''));
       screen.appendChild(Sidebar());
       screen.appendChild(main);
       /* 抽屉开着时盖一层遮罩：点它收起（窄屏专用，桌面遮罩不存在因为 drawerOpen 只在窄屏交互里置 true） */
